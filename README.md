@@ -1,8 +1,9 @@
 # KCP Rust
 
-[![Crates.io](https://img.shields.io/crates/v/kcp-rust.svg)]([https://crates.io/crates/kcp-rust](https://crates.io/crates/kcp-tokio))
-[![Documentation](https://docs.rs/kcp-rust/badge.svg)]([https://docs.rs/kcp-rust](https://github.com/leihuxi/rust-kcp/edit/main/README.md))
+[![Crates.io](https://img.shields.io/crates/v/kcp-tokio.svg)](https://crates.io/crates/kcp-tokio)
+[![Documentation](https://docs.rs/kcp-tokio/badge.svg)](https://docs.rs/kcp-tokio)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 
 A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol built on top of Tokio.
 
