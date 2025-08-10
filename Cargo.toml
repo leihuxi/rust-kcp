@@ -1,0 +1,66 @@
+[package]
+name = "kcp-rust"
+version = "0.2.0"
+edition = "2021"
+authors = ["KCP Rust Port"]
+description = "A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol"
+license = "MIT"
+keywords = ["kcp", "network", "protocol", "udp", "arq", "async", "tokio"]
+categories = ["network-programming", "asynchronous"]
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio", "dep:tokio-util"]
+
+[dependencies]
+# Core async runtime
+tokio = { version = "1.0", features = ["full"], optional = true }
+tokio-util = { version = "0.7", optional = true }
+
+# Async traits and utilities
+futures = "0.3"
+pin-project-lite = "0.2"
+
+# Serialization and networking
+bytes = "1.0"
+thiserror = "1.0"
+
+# Metrics and monitoring
+tracing = "0.1"
+tracing-futures = "0.2"
+
+# Random number generation
+rand = "0.8"
+
+# Lazy static for global state
+lazy_static = "1.4"
+
+[dev-dependencies]
+tokio-test = "0.4"
+rand = "0.8"
+criterion = "0.5"
+tracing-subscriber = "0.3"
+
+
+[[example]]
+name = "simple_echo"
+path = "examples/simple_echo.rs"
+
+[[example]]
+name = "interop_client"
+path = "examples/interop_client.rs"
+
+[[example]]
+name = "interop_client_simple"
+path = "examples/interop_client_simple.rs"
+
+[[example]]
+name = "quick_test"
+path = "examples/quick_test.rs"
+
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
