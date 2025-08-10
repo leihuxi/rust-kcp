@@ -1,5 +1,5 @@
 [package]
-name = "kcp-rust"
+name = "kcp-tokio"
 version = "0.2.0"
 edition = "2021"
 authors = ["Leihu.Xi leihuxi@gmail.com"]
