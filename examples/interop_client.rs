@@ -2,8 +2,8 @@
 //!
 //! Tests compatibility between Rust async KCP implementation and original C version
 
-use kcp_rust::async_kcp::KcpStream;
-use kcp_rust::config::KcpConfig;
+use kcp_tokio::async_kcp::KcpStream;
+use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info, warn};

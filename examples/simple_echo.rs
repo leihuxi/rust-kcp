@@ -1,7 +1,7 @@
 //! Simple async echo example using KCP
 
-use kcp_rust::async_kcp::{KcpListener, KcpStream};
-use kcp_rust::config::KcpConfig;
+use kcp_tokio::async_kcp::{KcpListener, KcpStream};
+use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing::{error, info};

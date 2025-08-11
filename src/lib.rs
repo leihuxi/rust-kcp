@@ -15,7 +15,7 @@
 //! ## Quick Start
 //!
 //! ```rust,no_run
-//! use kcp_rust::{KcpConfig, async_kcp::KcpStream};
+//! use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
 //! use std::net::SocketAddr;
 //!
 //! #[tokio::main]

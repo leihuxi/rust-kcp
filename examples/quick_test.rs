@@ -1,8 +1,8 @@
 //! Quick test for Rust KCP communication with C server
 
 use bytes::Bytes;
-use kcp_rust::async_kcp::engine::{KcpEngine, OutputFn};
-use kcp_rust::config::KcpConfig;
+use kcp_tokio::async_kcp::engine::{KcpEngine, OutputFn};
+use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -33,7 +33,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             socket
                 .send(&data)
                 .await
-                .map_err(kcp_rust::error::KcpError::Io)?;
+                .map_err(kcp_tokio::error::KcpError::Io)?;
             info!("Sent {} bytes to C server", data.len());
             Ok(())
         })

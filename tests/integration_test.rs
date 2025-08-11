@@ -1,8 +1,8 @@
 //! Integration tests for async KCP implementation
 
 use bytes::Bytes;
-use kcp_rust::async_kcp::engine::{KcpEngine, OutputFn};
-use kcp_rust::config::KcpConfig;
+use kcp_tokio::async_kcp::engine::{KcpEngine, OutputFn};
+use kcp_tokio::config::KcpConfig;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
