@@ -24,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-rust = "0.2.0"
+kcp-tokio = "0.3.1"
 ```
 
 ## 🎯 Quick Start
@@ -32,7 +32,7 @@ kcp-rust = "0.2.0"
 ### Basic Echo Server
 
 ```rust
-use kcp_rust::{KcpConfig, async_kcp::{KcpListener, KcpStream}};
+use kcp_tokio::{KcpConfig, async_kcp::{KcpListener, KcpStream}};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -58,7 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Basic Client
 
 ```rust
-use kcp_rust::{KcpConfig, async_kcp::KcpStream};
+use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -259,5 +259,6 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 🏷️ Version History
 
-- **v0.2.0**: Current version with full async support and comprehensive configuration
+- **v0.3.1**: Current version with full async support and comprehensive configuration
+- **v0.2.x**: Improved performance and bug fixes
 - **v0.1.x**: Initial implementation
