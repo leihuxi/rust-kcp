@@ -5,24 +5,34 @@ use tokio::net::UdpSocket;
 async fn test_basic_udp_debug() {
     // Server
     let server_addr = "127.0.0.1:18891";
-    let server = UdpSocket::bind(server_addr).await.expect("Failed to bind server");
+    let server = UdpSocket::bind(server_addr)
+        .await
+        .expect("Failed to bind server");
     println!("Server bound to {}", server.local_addr().unwrap());
-    
-    // Client  
-    let client = UdpSocket::bind("0.0.0.0:0").await.expect("Failed to bind client");
-    client.connect(server_addr).await.expect("Failed to connect client");
-    println!("Client bound to {} and connected to server", client.local_addr().unwrap());
-    
+
+    // Client
+    let client = UdpSocket::bind("0.0.0.0:0")
+        .await
+        .expect("Failed to bind client");
+    client
+        .connect(server_addr)
+        .await
+        .expect("Failed to connect client");
+    println!(
+        "Client bound to {} and connected to server",
+        client.local_addr().unwrap()
+    );
+
     // Spawn server task
     let server_task = tokio::spawn(async move {
         let mut buf = [0u8; 1024];
         println!("Server: Waiting for packets...");
-        
+
         match server.recv_from(&mut buf).await {
             Ok((size, peer_addr)) => {
                 let msg = std::str::from_utf8(&buf[..size]).unwrap_or("<invalid>");
                 println!("Server: Received '{}' from {}", msg, peer_addr);
-                
+
                 // Echo back
                 if let Err(e) = server.send_to(b"Echo received", peer_addr).await {
                     println!("Server: Failed to send echo: {}", e);
@@ -35,10 +45,10 @@ async fn test_basic_udp_debug() {
             }
         }
     });
-    
+
     // Give server time to start
     tokio::time::sleep(Duration::from_millis(50)).await;
-    
+
     // Send from client to server
     println!("Client: Sending message...");
     match client.send(b"Hello from client").await {
@@ -49,7 +59,7 @@ async fn test_basic_udp_debug() {
             println!("Client: Failed to send: {}", e);
         }
     }
-    
+
     // Try to receive response
     println!("Client: Waiting for response...");
     let mut buf = [0u8; 1024];
@@ -65,7 +75,7 @@ async fn test_basic_udp_debug() {
             println!("Client: Timeout waiting for response");
         }
     }
-    
+
     // Wait for server task
     let _ = tokio::time::timeout(Duration::from_secs(1), server_task).await;
     println!("Basic UDP test completed");

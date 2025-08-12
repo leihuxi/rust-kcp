@@ -45,7 +45,7 @@ pub struct KcpListener {
     // Connection management
     pending_connections: Arc<RwLock<HashMap<SocketAddr, IncomingConnection>>>,
     accepting_connections: Arc<RwLock<HashSet<SocketAddr>>>, // Track connections being accepted
-    active_connections: Arc<RwLock<HashSet<SocketAddr>>>, // Track active established connections
+    active_connections: Arc<RwLock<HashSet<SocketAddr>>>,    // Track active established connections
     active_streams: Arc<RwLock<HashMap<SocketAddr, StreamHandle>>>, // Active streams for packet routing
     connection_queue: mpsc::UnboundedReceiver<IncomingConnection>,
     connection_sender: mpsc::UnboundedSender<IncomingConnection>,
@@ -90,16 +90,16 @@ impl KcpListener {
                 {
                     let mut accepting = self.accepting_connections.write().await;
                     let active = self.active_connections.read().await;
-                    
+
                     // Double-check that this peer isn't already active
                     if active.contains(&incoming.peer_addr) {
                         info!(peer = %incoming.peer_addr, "Ignoring connection attempt from active peer");
                         continue;
                     }
-                    
+
                     accepting.insert(incoming.peer_addr);
                 }
-                
+
                 match self.create_stream_for_connection(incoming.clone()).await {
                     Ok(stream) => {
                         // Remove from accepting set (active marking done in create_stream_for_connection)
@@ -181,7 +181,7 @@ impl KcpListener {
                                 let streams = active_streams.read().await;
                                 let stream_count = streams.len();
                                 trace!(peer = %peer_addr, stream_count = stream_count, "Checking for active stream");
-                                
+
                                 if let Some(stream) = streams.get(&peer_addr) {
                                     // Route packet to active stream
                                     trace!(peer = %peer_addr, "Routing packet to active stream");
@@ -271,7 +271,7 @@ impl KcpListener {
                     );
                     return Ok(());
                 }
-                
+
                 // If connection is pending, we might want to process additional packets
                 // but for now, we'll treat them as retransmissions to avoid duplicate connections
                 if pending.contains_key(&peer_addr) {
@@ -290,14 +290,14 @@ impl KcpListener {
 
                 // This is truly a new connection - first KCP packet from this peer
                 debug!(
-                    peer = %peer_addr, 
-                    conv = header.conv, 
+                    peer = %peer_addr,
+                    conv = header.conv,
                     "First KCP packet from new peer"
                 );
 
                 let incoming = IncomingConnection {
                     peer_addr,
-                    conv: header.conv,  // Use conversation ID from client
+                    conv: header.conv, // Use conversation ID from client
                     handshake_data: data.clone(),
                 };
 
@@ -314,8 +314,8 @@ impl KcpListener {
                     pending.remove(&peer_addr);
                 } else {
                     debug!(
-                        peer = %peer_addr, 
-                        conv = header.conv, 
+                        peer = %peer_addr,
+                        conv = header.conv,
                         "New KCP connection queued for accept"
                     );
                 }
@@ -334,7 +334,7 @@ impl KcpListener {
         let stream = KcpStream::new_server_stream(
             self.socket.clone(),
             incoming.peer_addr,
-            incoming.conv,  // Use the conversation ID from client
+            incoming.conv, // Use the conversation ID from client
             self.config.clone(),
             incoming.handshake_data, // Pass the initial packet
         )
@@ -350,7 +350,7 @@ impl KcpListener {
             let mut pending = self.pending_connections.write().await;
             let mut active = self.active_connections.write().await;
             let mut streams = self.active_streams.write().await;
-            
+
             pending.remove(&incoming.peer_addr);
             active.insert(incoming.peer_addr);
             streams.insert(incoming.peer_addr, handle);
@@ -364,7 +364,6 @@ impl KcpListener {
 
         Ok((stream, incoming.peer_addr))
     }
-
 
     /// Clean up expired pending connections
     async fn cleanup_pending_connections(

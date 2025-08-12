@@ -117,7 +117,6 @@ impl KcpStream {
         Ok(())
     }
 
-
     /// Create a new server-side KCP stream (with proper routing)
     pub async fn new_server_stream(
         listener_socket: Arc<UdpSocket>,
@@ -161,10 +160,10 @@ impl KcpStream {
             let mut engine = stream.engine.lock().await;
             engine.set_output(output_fn);
             engine.start().await?;
-            
+
             // Process the initial packet immediately
             engine.input(initial_packet).await?;
-            
+
             // Force an update to send ACK/response
             engine.update().await?;
             engine.flush().await?;
@@ -270,7 +269,6 @@ impl KcpStream {
         info!(peer = %self.peer_addr, "KCP stream closed");
         Ok(())
     }
-
 
     /// Start background tasks for unconnected socket (server side)
     async fn start_background_tasks_unconnected(&mut self) -> Result<()> {
@@ -434,7 +432,6 @@ impl KcpStream {
 
         Ok(())
     }
-
 }
 
 impl Drop for KcpStream {

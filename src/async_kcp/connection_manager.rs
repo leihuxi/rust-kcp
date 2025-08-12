@@ -1,11 +1,11 @@
 //! Connection manager for routing packets to server streams
 
+use crate::error::Result;
+use bytes::Bytes;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
-use bytes::Bytes;
-use crate::error::Result;
 
 /// Handle for a server stream connection
 pub struct StreamHandle {
@@ -28,7 +28,11 @@ impl ConnectionManager {
     }
 
     /// Register a new stream
-    pub async fn register_stream(&self, peer_addr: SocketAddr, sender: mpsc::UnboundedSender<Bytes>) {
+    pub async fn register_stream(
+        &self,
+        peer_addr: SocketAddr,
+        sender: mpsc::UnboundedSender<Bytes>,
+    ) {
         let mut streams = self.streams.write().await;
         streams.insert(peer_addr, sender);
     }
