@@ -1,6 +1,7 @@
 //! Async KCP implementation modules
 
 pub mod connection;
+pub mod connection_manager;
 pub mod engine;
 pub mod listener;
 pub mod session;

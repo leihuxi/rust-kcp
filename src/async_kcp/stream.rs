@@ -20,7 +20,7 @@ use tracing::{error, info, trace};
 
 /// High-level async KCP stream providing TCP-like interface over UDP
 pub struct KcpStream {
-    engine: Arc<Mutex<KcpEngine>>,
+    pub(crate) engine: Arc<Mutex<KcpEngine>>,
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     config: KcpConfig,
@@ -48,21 +48,14 @@ impl KcpStream {
         Self::new_with_socket(socket, addr, config, true).await
     }
 
-    /// Create a new KCP stream from an existing UDP socket
-    pub async fn new_with_socket(
+    /// Create a new KCP stream with a specific conversation ID (for server side)
+    pub async fn new_with_conv(
         socket: UdpSocket,
         peer_addr: SocketAddr,
+        conv: ConvId,
         config: KcpConfig,
-        is_client: bool,
+        _is_client: bool,
     ) -> Result<Self> {
-        let conv = if is_client {
-            // Use fixed conversation ID for C server compatibility
-            0x12345678u32
-        } else {
-            // Server will use the conversation ID from the first packet
-            0
-        };
-
         let engine = KcpEngine::new(conv, config.clone());
         let socket = Arc::new(socket);
         let engine = Arc::new(Mutex::new(engine));
@@ -85,7 +78,9 @@ impl KcpStream {
         let output_fn: OutputFn = Arc::new(move |data: Bytes| {
             let socket = socket_clone.clone();
             Box::pin(async move {
+                let len = data.len();
                 socket.send(&data).await.map_err(KcpError::Io)?;
+                trace!("Client sent {} bytes via connected socket", len);
                 Ok(())
             })
         });
@@ -99,15 +94,109 @@ impl KcpStream {
         // Start background tasks
         stream.start_background_tasks().await?;
 
-        // Perform handshake if client
-        if is_client {
-            stream.handshake().await?;
-        }
-
+        // Mark as connected
         stream.connected = true;
         info!(peer = %peer_addr, conv = conv, "KCP stream established");
 
         Ok(stream)
+    }
+
+    /// Process the initial packet that established the connection (for server side)
+    pub async fn process_initial_packet(&mut self, data: Bytes) -> Result<()> {
+        let mut engine = self.engine.lock().await;
+        engine.input(data).await?;
+        Ok(())
+    }
+
+    /// Process a packet from the listener (for server streams)
+    pub async fn input_packet(&self, data: Bytes) -> Result<()> {
+        let mut engine = self.engine.lock().await;
+        engine.input(data).await?;
+        // Immediately process any pending output
+        engine.update().await?;
+        Ok(())
+    }
+
+
+    /// Create a new server-side KCP stream (with proper routing)
+    pub async fn new_server_stream(
+        listener_socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        conv: ConvId,
+        config: KcpConfig,
+        initial_packet: Bytes,
+    ) -> Result<Self> {
+        // For server streams, we use the shared listener socket
+        // The key insight: responses must come from the same port the client connected to
+        let engine = KcpEngine::new(conv, config.clone());
+        let engine = Arc::new(Mutex::new(engine));
+
+        let mut stream = Self {
+            engine: engine.clone(),
+            socket: listener_socket.clone(),
+            peer_addr,
+            config,
+            read_buf: crate::common::try_get_buffer(2048),
+            write_notify: Arc::new(Notify::new()),
+            update_task: None,
+            recv_task: None,
+            connected: false,
+            closed: false,
+        };
+
+        // Set up output function to send via listener socket to specific peer
+        let socket_clone = listener_socket.clone();
+        let peer = peer_addr;
+        let output_fn: OutputFn = Arc::new(move |data: Bytes| {
+            let socket = socket_clone.clone();
+            Box::pin(async move {
+                let len = data.len();
+                socket.send_to(&data, peer).await.map_err(KcpError::Io)?;
+                trace!("Sent {} bytes to {}", len, peer);
+                Ok(())
+            })
+        });
+
+        {
+            let mut engine = stream.engine.lock().await;
+            engine.set_output(output_fn);
+            engine.start().await?;
+            
+            // Process the initial packet immediately
+            engine.input(initial_packet).await?;
+            
+            // Force an update to send ACK/response
+            engine.update().await?;
+            engine.flush().await?;
+        }
+
+        // Start only update task for server stream
+        // Packets are routed by the listener, not received directly
+        stream.start_update_task_only().await?;
+
+        // Mark as connected
+        stream.connected = true;
+        info!(peer = %peer_addr, conv = conv, "KCP server stream established (shared socket mode)");
+
+        Ok(stream)
+    }
+
+    /// Create a new KCP stream from an existing UDP socket
+    pub async fn new_with_socket(
+        socket: UdpSocket,
+        peer_addr: SocketAddr,
+        config: KcpConfig,
+        is_client: bool,
+    ) -> Result<Self> {
+        let conv = if is_client {
+            // Use fixed conversation ID for C server compatibility
+            0x12345678u32
+        } else {
+            // Server will use the conversation ID from the first packet
+            0
+        };
+
+        Self::new_with_conv(socket, peer_addr, conv, config, is_client).await
     }
 
     /// Send data through the KCP stream
@@ -119,9 +208,8 @@ impl KcpStream {
         let bytes = Bytes::copy_from_slice(data);
         let mut engine = self.engine.lock().await;
         engine.send(bytes).await?;
-
-        // Notify that we have data to send
-        self.write_notify.notify_one();
+        // Immediately flush the data
+        engine.flush().await?;
 
         Ok(())
     }
@@ -183,39 +271,69 @@ impl KcpStream {
         Ok(())
     }
 
-    /// Perform handshake for client connections
-    async fn handshake(&mut self) -> Result<()> {
-        // Send initial handshake packet
-        let handshake_data = b"KCP_HANDSHAKE";
-        self.send(handshake_data).await?;
 
-        // Wait for response with timeout
-        let timeout = tokio::time::sleep(self.config.connect_timeout);
-        tokio::pin!(timeout);
+    /// Start background tasks for unconnected socket (server side)
+    async fn start_background_tasks_unconnected(&mut self) -> Result<()> {
+        let engine = self.engine.clone();
+        let write_notify = self.write_notify.clone();
+        let update_interval = self.config.nodelay.interval;
 
-        loop {
-            tokio::select! {
-                _ = &mut timeout => {
-                    return Err(KcpError::connection(ConnectionError::Timeout));
-                }
-                result = self.recv() => {
-                    match result? {
-                        Some(data) if data.as_ref() == handshake_data => {
-                            return Ok(());
+        // Update task - periodically calls engine.update()
+        self.update_task = Some(tokio::spawn(async move {
+            let mut interval = interval(std::time::Duration::from_millis(update_interval as u64));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let mut engine = engine.lock().await;
+                        if let Err(e) = engine.update().await {
+                            error!(error = %e, "Engine update failed");
+                            break;
                         }
-                        Some(_) => {
-                            // Unexpected data, continue waiting
-                            continue;
-                        }
-                        None => {
-                            // No data yet, continue waiting
-                            tokio::task::yield_now().await;
-                            continue;
+                    }
+                    _ = write_notify.notified() => {
+                        // Flush immediately when notified of new data
+                        let mut engine = engine.lock().await;
+                        if let Err(e) = engine.flush().await {
+                            error!(error = %e, "Engine flush failed");
+                            break;
                         }
                     }
                 }
             }
-        }
+        }));
+
+        // Receive task - receives UDP packets from any source and filters by peer_addr
+        let engine = self.engine.clone();
+        let socket = self.socket.clone();
+        let expected_peer = self.peer_addr;
+
+        self.recv_task = Some(tokio::spawn(async move {
+            let mut buf = vec![0u8; 65536];
+
+            loop {
+                match socket.recv_from(&mut buf).await {
+                    Ok((size, src_addr)) => {
+                        // Only process packets from our peer
+                        if src_addr == expected_peer {
+                            let data = Bytes::copy_from_slice(&buf[..size]);
+                            let mut engine = engine.lock().await;
+                            if let Err(e) = engine.input(data).await {
+                                trace!(error = %e, "Failed to process packet");
+                                // Continue processing other packets
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, "UDP receive failed");
+                        break;
+                    }
+                }
+            }
+        }));
+
+        Ok(())
     }
 
     /// Start background tasks for update and packet receiving
@@ -261,11 +379,14 @@ impl KcpStream {
                 match socket.recv(&mut buf).await {
                     Ok(size) => {
                         let data = Bytes::copy_from_slice(&buf[..size]);
+                        trace!("Client received {} bytes", size);
                         let mut engine = engine.lock().await;
 
                         if let Err(e) = engine.input(data).await {
                             trace!(error = %e, "Failed to process packet");
                             // Continue processing other packets
+                        } else {
+                            trace!("Successfully processed {} bytes", size);
                         }
                     }
                     Err(e) => {
@@ -278,6 +399,42 @@ impl KcpStream {
 
         Ok(())
     }
+
+    /// Start only the update task (for server streams)
+    async fn start_update_task_only(&mut self) -> Result<()> {
+        let engine = self.engine.clone();
+        let write_notify = self.write_notify.clone();
+        let update_interval = self.config.nodelay.interval;
+
+        // Update task - periodically calls engine.update()
+        self.update_task = Some(tokio::spawn(async move {
+            let mut interval = interval(std::time::Duration::from_millis(update_interval as u64));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        let mut engine = engine.lock().await;
+                        if let Err(e) = engine.update().await {
+                            error!(error = %e, "Engine update failed");
+                            break;
+                        }
+                    }
+                    _ = write_notify.notified() => {
+                        // Flush immediately when notified of new data
+                        let mut engine = engine.lock().await;
+                        if let Err(e) = engine.flush().await {
+                            error!(error = %e, "Engine flush failed");
+                            break;
+                        }
+                    }
+                }
+            }
+        }));
+
+        Ok(())
+    }
+
 }
 
 impl Drop for KcpStream {
@@ -382,7 +539,9 @@ impl AsyncWrite for KcpStream {
         let engine = self.engine.clone();
         let mut flush_future = Box::pin(async move {
             let mut engine = engine.lock().await;
-            engine.flush().await
+            // Ensure data is sent immediately
+            engine.flush().await?;
+            engine.update().await
         });
 
         match flush_future.as_mut().poll(cx) {

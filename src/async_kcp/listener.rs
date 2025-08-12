@@ -6,13 +6,27 @@ use crate::config::KcpConfig;
 use crate::error::{ConnectionError, KcpError, Result};
 
 use bytes::Bytes;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
+
+/// Simple stream handle for packet routing
+struct StreamHandle {
+    engine: Arc<Mutex<crate::async_kcp::engine::KcpEngine>>,
+}
+
+impl StreamHandle {
+    async fn input_packet(&self, data: Bytes) -> Result<()> {
+        let mut engine = self.engine.lock().await;
+        engine.input(data).await?;
+        engine.update().await?;
+        Ok(())
+    }
+}
 
 /// Incoming connection information
 #[derive(Debug, Clone)]
@@ -30,6 +44,9 @@ pub struct KcpListener {
 
     // Connection management
     pending_connections: Arc<RwLock<HashMap<SocketAddr, IncomingConnection>>>,
+    accepting_connections: Arc<RwLock<HashSet<SocketAddr>>>, // Track connections being accepted
+    active_connections: Arc<RwLock<HashSet<SocketAddr>>>, // Track active established connections
+    active_streams: Arc<RwLock<HashMap<SocketAddr, StreamHandle>>>, // Active streams for packet routing
     connection_queue: mpsc::UnboundedReceiver<IncomingConnection>,
     connection_sender: mpsc::UnboundedSender<IncomingConnection>,
 
@@ -51,6 +68,9 @@ impl KcpListener {
             config,
             local_addr,
             pending_connections: Arc::new(RwLock::new(HashMap::new())),
+            accepting_connections: Arc::new(RwLock::new(HashSet::new())),
+            active_connections: Arc::new(RwLock::new(HashSet::new())),
+            active_streams: Arc::new(RwLock::new(HashMap::new())),
             connection_queue,
             connection_sender,
             listen_task: None,
@@ -66,11 +86,35 @@ impl KcpListener {
     pub async fn accept(&mut self) -> Result<(KcpStream, SocketAddr)> {
         loop {
             if let Some(incoming) = self.connection_queue.recv().await {
-                match self.create_stream_for_connection(incoming).await {
+                // Mark as accepting to prevent duplicate processing
+                {
+                    let mut accepting = self.accepting_connections.write().await;
+                    let active = self.active_connections.read().await;
+                    
+                    // Double-check that this peer isn't already active
+                    if active.contains(&incoming.peer_addr) {
+                        info!(peer = %incoming.peer_addr, "Ignoring connection attempt from active peer");
+                        continue;
+                    }
+                    
+                    accepting.insert(incoming.peer_addr);
+                }
+                
+                match self.create_stream_for_connection(incoming.clone()).await {
                     Ok(stream) => {
+                        // Remove from accepting set (active marking done in create_stream_for_connection)
+                        {
+                            let mut accepting = self.accepting_connections.write().await;
+                            accepting.remove(&incoming.peer_addr);
+                        }
                         return Ok((stream.0, stream.1));
                     }
                     Err(e) => {
+                        // Remove from accepting set on error
+                        {
+                            let mut accepting = self.accepting_connections.write().await;
+                            accepting.remove(&incoming.peer_addr);
+                        }
                         warn!(error = %e, "Failed to create stream for incoming connection");
                         continue;
                     }
@@ -91,6 +135,13 @@ impl KcpListener {
         self.pending_connections.read().await.len()
     }
 
+    /// Remove a connection from active tracking (called when stream is dropped)
+    pub async fn remove_active_connection(&self, peer_addr: SocketAddr) {
+        let mut active = self.active_connections.write().await;
+        active.remove(&peer_addr);
+        debug!(peer = %peer_addr, "Removed active connection");
+    }
+
     /// Close the listener
     pub async fn close(&mut self) -> Result<()> {
         if let Some(task) = self.listen_task.take() {
@@ -105,10 +156,14 @@ impl KcpListener {
     async fn start_listening(&mut self) -> Result<()> {
         let socket = self.socket.clone();
         let pending_connections = self.pending_connections.clone();
+        let accepting_connections = self.accepting_connections.clone();
+        let active_connections = self.active_connections.clone();
+        let active_streams = self.active_streams.clone();
         let connection_sender = self.connection_sender.clone();
         let handshake_timeout = self.config.connect_timeout;
 
         self.listen_task = Some(tokio::spawn(async move {
+            info!("Listener background task started, waiting for packets...");
             let mut buf = vec![0u8; 65536];
             let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
 
@@ -116,14 +171,42 @@ impl KcpListener {
                 tokio::select! {
                     // Receive incoming packets
                     recv_result = socket.recv_from(&mut buf) => {
+                        trace!("Listener received packet result: {:?}", recv_result.as_ref().map(|(size, addr)| (*size, *addr)));
                         match recv_result {
                             Ok((size, peer_addr)) => {
                                 let data = Bytes::copy_from_slice(&buf[..size]);
+                                trace!("Received {} bytes from {}: {:02x?}", size, peer_addr, &data[..size.min(16)]);
 
+                                // First check if this is from an active stream
+                                let streams = active_streams.read().await;
+                                let stream_count = streams.len();
+                                trace!(peer = %peer_addr, stream_count = stream_count, "Checking for active stream");
+                                
+                                if let Some(stream) = streams.get(&peer_addr) {
+                                    // Route packet to active stream
+                                    trace!(peer = %peer_addr, "Routing packet to active stream");
+                                    if let Err(e) = stream.input_packet(data).await {
+                                        trace!(
+                                            peer = %peer_addr,
+                                            error = %e,
+                                            "Failed to input packet to stream"
+                                        );
+                                    } else {
+                                        trace!(peer = %peer_addr, "Successfully routed packet to stream");
+                                    }
+                                    continue;
+                                } else {
+                                    trace!(peer = %peer_addr, "No active stream found for this peer");
+                                }
+                                drop(streams);
+
+                                // Not an active stream, handle as potential new connection
                                 if let Err(e) = Self::handle_incoming_packet(
                                     data,
                                     peer_addr,
                                     &pending_connections,
+                                    &accepting_connections,
+                                    &active_connections,
                                     &connection_sender,
                                 ).await {
                                     trace!(
@@ -156,50 +239,85 @@ impl KcpListener {
         data: Bytes,
         peer_addr: SocketAddr,
         pending_connections: &Arc<RwLock<HashMap<SocketAddr, IncomingConnection>>>,
+        accepting_connections: &Arc<RwLock<HashSet<SocketAddr>>>,
+        active_connections: &Arc<RwLock<HashSet<SocketAddr>>>,
         connection_sender: &mpsc::UnboundedSender<IncomingConnection>,
     ) -> Result<()> {
-        // Check if this is a handshake packet
-        if data.len() >= 13 && &data[..13] == b"KCP_HANDSHAKE" {
-            let mut pending = pending_connections.write().await;
+        // Check if this is a KCP packet (standard KCP protocol)
+        if data.len() >= KcpHeader::SIZE {
+            let mut data_clone = data.clone();
+            if let Some(header) = KcpHeader::decode(&mut data_clone) {
+                // Use read locks to check all connection states
+                let pending = pending_connections.read().await;
+                let accepting = accepting_connections.read().await;
+                let active = active_connections.read().await;
 
-            if let std::collections::hash_map::Entry::Vacant(e) = pending.entry(peer_addr) {
-                // New connection attempt
-                let conv = Self::generate_conversation_id();
+                // Ignore packets from peers that already have active connections
+                if active.contains(&peer_addr) {
+                    trace!(
+                        peer = %peer_addr,
+                        conv = header.conv,
+                        "Packet from active connection, ignoring (handled by stream)"
+                    );
+                    return Ok(());
+                }
+
+                // Check if already accepting or pending this connection
+                if accepting.contains(&peer_addr) {
+                    trace!(
+                        peer = %peer_addr,
+                        conv = header.conv,
+                        "Connection is being accepted, packet will be handled by stream once created"
+                    );
+                    return Ok(());
+                }
+                
+                // If connection is pending, we might want to process additional packets
+                // but for now, we'll treat them as retransmissions to avoid duplicate connections
+                if pending.contains_key(&peer_addr) {
+                    trace!(
+                        peer = %peer_addr,
+                        conv = header.conv,
+                        "Connection already pending, may be retransmission or additional data packet"
+                    );
+                    return Ok(());
+                }
+
+                // Release read locks before acquiring write lock
+                drop(active);
+                drop(accepting);
+                drop(pending);
+
+                // This is truly a new connection - first KCP packet from this peer
+                debug!(
+                    peer = %peer_addr, 
+                    conv = header.conv, 
+                    "First KCP packet from new peer"
+                );
+
                 let incoming = IncomingConnection {
                     peer_addr,
-                    conv,
+                    conv: header.conv,  // Use conversation ID from client
                     handshake_data: data.clone(),
                 };
 
-                e.insert(incoming.clone());
+                // Insert into pending FIRST to prevent duplicates from racing
+                let mut pending = pending_connections.write().await;
+                pending.insert(peer_addr, incoming.clone());
+                drop(pending);
 
                 // Notify about new connection
                 if connection_sender.send(incoming).is_err() {
                     warn!("Connection queue is full or closed");
-                }
-
-                debug!(peer = %peer_addr, conv = conv, "New handshake received");
-            }
-
-            return Ok(());
-        }
-
-        // Check if this is a KCP packet from known peer
-        if data.len() >= KcpHeader::SIZE {
-            let mut data_clone = data.clone();
-            if let Some(header) = KcpHeader::decode(&mut data_clone) {
-                let pending = pending_connections.read().await;
-
-                if let Some(incoming) = pending.get(&peer_addr) {
-                    if header.conv == incoming.conv {
-                        // This is a valid KCP packet for a pending connection
-                        trace!(
-                            peer = %peer_addr,
-                            conv = header.conv,
-                            cmd = header.cmd,
-                            "KCP packet from pending connection"
-                        );
-                    }
+                    // Remove from pending if we couldn't queue it
+                    let mut pending = pending_connections.write().await;
+                    pending.remove(&peer_addr);
+                } else {
+                    debug!(
+                        peer = %peer_addr, 
+                        conv = header.conv, 
+                        "New KCP connection queued for accept"
+                    );
                 }
             }
         }
@@ -212,49 +330,41 @@ impl KcpListener {
         &self,
         incoming: IncomingConnection,
     ) -> Result<(KcpStream, SocketAddr)> {
-        // Remove from pending connections
-        {
-            let mut pending = self.pending_connections.write().await;
-            pending.remove(&incoming.peer_addr);
-        }
-
-        // Create a new UDP socket for this connection
-        let new_socket = UdpSocket::bind("0.0.0.0:0").await.map_err(KcpError::Io)?;
-
-        new_socket
-            .connect(incoming.peer_addr)
-            .await
-            .map_err(KcpError::Io)?;
-
-        // Send handshake response
-        new_socket
-            .send(&incoming.handshake_data)
-            .await
-            .map_err(KcpError::Io)?;
-
-        // Create KCP stream
-        let stream = KcpStream::new_with_socket(
-            new_socket,
+        // Create server stream using the shared socket
+        let stream = KcpStream::new_server_stream(
+            self.socket.clone(),
             incoming.peer_addr,
+            incoming.conv,  // Use the conversation ID from client
             self.config.clone(),
-            false, // This is server side
+            incoming.handshake_data, // Pass the initial packet
         )
         .await?;
+
+        // Create a handle for packet routing
+        let handle = StreamHandle {
+            engine: stream.engine.clone(),
+        };
+
+        // Mark connection as active and save the handle
+        {
+            let mut pending = self.pending_connections.write().await;
+            let mut active = self.active_connections.write().await;
+            let mut streams = self.active_streams.write().await;
+            
+            pending.remove(&incoming.peer_addr);
+            active.insert(incoming.peer_addr);
+            streams.insert(incoming.peer_addr, handle);
+        }
 
         info!(
             peer = %incoming.peer_addr,
             conv = incoming.conv,
-            "Connection accepted"
+            "Connection accepted and registered for packet routing"
         );
 
         Ok((stream, incoming.peer_addr))
     }
 
-    /// Generate a unique conversation ID for new connections
-    fn generate_conversation_id() -> ConvId {
-        // Generate server-side conversation ID (MSB clear)
-        rand::random::<u32>() & 0x7FFFFFFF
-    }
 
     /// Clean up expired pending connections
     async fn cleanup_pending_connections(
