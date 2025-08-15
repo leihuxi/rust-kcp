@@ -28,7 +28,7 @@ pub struct KcpStream {
     // Read/write state
     read_buf: BytesMut,
     write_notify: Arc<Notify>,
-    read_notify: Arc<Notify>,  // Notify when data is available to read
+    read_notify: Arc<Notify>, // Notify when data is available to read
 
     // Background tasks
     update_task: Option<tokio::task::JoinHandle<()>>,
@@ -43,7 +43,7 @@ impl KcpStream {
     /// Connect to a remote KCP server
     pub async fn connect(addr: SocketAddr, config: KcpConfig) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(KcpError::Io)?;
-        
+
         let local_addr = socket.local_addr().map_err(KcpError::Io)?;
         trace!("CLIENT: Bound to local address {}", local_addr);
 
@@ -381,7 +381,7 @@ impl KcpStream {
         let engine = self.engine.clone();
         let socket = self.socket.clone();
         let read_notify = self.read_notify.clone();
-        
+
         trace!("Starting receive task");
 
         self.recv_task = Some(tokio::spawn(async move {
@@ -393,7 +393,7 @@ impl KcpStream {
                     Ok(size) => {
                         // Use slice directly without copying when possible
                         let data = Bytes::copy_from_slice(&buf[..size]);
-                        
+
                         // Try to get lock without blocking to reduce contention
                         let processed = match engine.try_lock() {
                             Ok(mut guard) => {
@@ -415,7 +415,7 @@ impl KcpStream {
                                 }
                             }
                         };
-                        
+
                         // Only notify if packet was processed successfully
                         if processed {
                             read_notify.notify_one();
@@ -497,7 +497,7 @@ impl AsyncRead for KcpStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         trace!("poll_read called");
-        
+
         if self.closed {
             return Poll::Ready(Ok(()));
         }
@@ -513,7 +513,7 @@ impl AsyncRead for KcpStream {
 
         // Try to receive data from KCP
         trace!("No data in buffer, trying to receive from KCP engine");
-        
+
         // Try a few times to handle race conditions
         for _ in 0..3 {
             let engine = self.engine.clone();
@@ -542,7 +542,7 @@ impl AsyncRead for KcpStream {
                 }
             }
         }
-        
+
         // No data after retries, wake for next poll
         cx.waker().wake_by_ref();
         Poll::Pending

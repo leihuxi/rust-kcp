@@ -24,7 +24,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3.1"
+kcp-tokio = "0.3.3"
 ```
 
 ## 🎯 Quick Start
@@ -135,13 +135,13 @@ let config = KcpConfig::new()
 
 ### Performance Modes
 
-- **Normal Mode**: Balanced performance and reliability (default)
-- **Fast Mode**: Optimized for low latency applications
-- **Turbo Mode**: Maximum performance with minimal latency
+- **Normal Mode**: Balanced performance and reliability (40ms interval)
+- **Fast Mode**: Optimized for low latency applications (10ms interval)  
+- **Turbo Mode**: Maximum performance with minimal latency (5ms interval)
 
 ```rust
 let config = KcpConfig::new()
-    .turbo_mode()                  // Maximum performance
+    .turbo_mode()                  // Maximum performance (5ms updates)
     .window_size(256, 256)         // Larger windows
     .mtu(1200);                    // Optimized MTU
 ```
@@ -259,6 +259,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## 🏷️ Version History
 
-- **v0.3.1**: Current version with full async support and comprehensive configuration
+- **v0.3.3**: Current version with optimized performance and reduced latency
+- **v0.3.1**: Full async support and comprehensive configuration
 - **v0.2.x**: Improved performance and bug fixes
 - **v0.1.x**: Initial implementation
