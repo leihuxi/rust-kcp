@@ -74,7 +74,7 @@ impl NodeDelayConfig {
     pub fn fast() -> Self {
         Self {
             nodelay: true,
-            interval: 20,
+            interval: 10,  // Reduced from 20ms for lower latency
             resend: 2,
             no_congestion_control: false,
         }
@@ -84,8 +84,8 @@ impl NodeDelayConfig {
     pub fn turbo() -> Self {
         Self {
             nodelay: true,
-            interval: 10,
-            resend: 2,
+            interval: 5,   // Ultra-low latency, 5ms update interval
+            resend: 1,     // Faster resend
             no_congestion_control: true,
         }
     }

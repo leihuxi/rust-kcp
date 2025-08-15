@@ -28,6 +28,7 @@ pub struct KcpStream {
     // Read/write state
     read_buf: BytesMut,
     write_notify: Arc<Notify>,
+    read_notify: Arc<Notify>,  // Notify when data is available to read
 
     // Background tasks
     update_task: Option<tokio::task::JoinHandle<()>>,
@@ -42,8 +43,12 @@ impl KcpStream {
     /// Connect to a remote KCP server
     pub async fn connect(addr: SocketAddr, config: KcpConfig) -> Result<Self> {
         let socket = UdpSocket::bind("0.0.0.0:0").await.map_err(KcpError::Io)?;
+        
+        let local_addr = socket.local_addr().map_err(KcpError::Io)?;
+        trace!("CLIENT: Bound to local address {}", local_addr);
 
         socket.connect(addr).await.map_err(KcpError::Io)?;
+        trace!("CLIENT: Connected to remote address {}", addr);
 
         Self::new_with_socket(socket, addr, config, true).await
     }
@@ -67,6 +72,7 @@ impl KcpStream {
             config,
             read_buf: crate::common::try_get_buffer(2048),
             write_notify: Arc::new(Notify::new()),
+            read_notify: Arc::new(Notify::new()),
             update_task: None,
             recv_task: None,
             connected: false,
@@ -80,7 +86,7 @@ impl KcpStream {
             Box::pin(async move {
                 let len = data.len();
                 socket.send(&data).await.map_err(KcpError::Io)?;
-                trace!("Client sent {} bytes via connected socket", len);
+                trace!("Sent {} bytes via connected socket", len);
                 Ok(())
             })
         });
@@ -89,6 +95,8 @@ impl KcpStream {
             let mut engine = stream.engine.lock().await;
             engine.set_output(output_fn);
             engine.start().await?;
+            // Force initial update to send any pending data
+            engine.update().await?;
         }
 
         // Start background tasks
@@ -137,6 +145,7 @@ impl KcpStream {
             config,
             read_buf: crate::common::try_get_buffer(2048),
             write_notify: Arc::new(Notify::new()),
+            read_notify: Arc::new(Notify::new()),
             update_task: None,
             recv_task: None,
             connected: false,
@@ -208,7 +217,7 @@ impl KcpStream {
         let mut engine = self.engine.lock().await;
         engine.send(bytes).await?;
         // Immediately flush the data
-        engine.flush().await?;
+        self.write_notify.notify_one();
 
         Ok(())
     }
@@ -293,6 +302,7 @@ impl KcpStream {
                     _ = write_notify.notified() => {
                         // Flush immediately when notified of new data
                         let mut engine = engine.lock().await;
+                        // Just call flush - it already does everything needed to send data
                         if let Err(e) = engine.flush().await {
                             error!(error = %e, "Engine flush failed");
                             break;
@@ -357,6 +367,7 @@ impl KcpStream {
                     _ = write_notify.notified() => {
                         // Flush immediately when notified of new data
                         let mut engine = engine.lock().await;
+                        // Just call flush - it already does everything needed to send data
                         if let Err(e) = engine.flush().await {
                             error!(error = %e, "Engine flush failed");
                             break;
@@ -369,22 +380,45 @@ impl KcpStream {
         // Receive task - receives UDP packets and feeds them to engine
         let engine = self.engine.clone();
         let socket = self.socket.clone();
+        let read_notify = self.read_notify.clone();
+        
+        trace!("Starting receive task");
 
         self.recv_task = Some(tokio::spawn(async move {
+            // Pre-allocate buffer once to avoid repeated allocations
             let mut buf = vec![0u8; 65536];
 
             loop {
                 match socket.recv(&mut buf).await {
                     Ok(size) => {
+                        // Use slice directly without copying when possible
                         let data = Bytes::copy_from_slice(&buf[..size]);
-                        trace!("Client received {} bytes", size);
-                        let mut engine = engine.lock().await;
-
-                        if let Err(e) = engine.input(data).await {
-                            trace!(error = %e, "Failed to process packet");
-                            // Continue processing other packets
-                        } else {
-                            trace!("Successfully processed {} bytes", size);
+                        
+                        // Try to get lock without blocking to reduce contention
+                        let processed = match engine.try_lock() {
+                            Ok(mut guard) => {
+                                if let Err(e) = guard.input(data.clone()).await {
+                                    trace!(error = %e, "Failed to process packet");
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                            Err(_) => {
+                                // Lock is busy, fall back to async lock
+                                let mut guard = engine.lock().await;
+                                if let Err(e) = guard.input(data).await {
+                                    trace!(error = %e, "Failed to process packet");
+                                    false
+                                } else {
+                                    true
+                                }
+                            }
+                        };
+                        
+                        // Only notify if packet was processed successfully
+                        if processed {
+                            read_notify.notify_one();
                         }
                     }
                     Err(e) => {
@@ -421,6 +455,7 @@ impl KcpStream {
                     _ = write_notify.notified() => {
                         // Flush immediately when notified of new data
                         let mut engine = engine.lock().await;
+                        // Just call flush - it already does everything needed to send data
                         if let Err(e) = engine.flush().await {
                             error!(error = %e, "Engine flush failed");
                             break;
@@ -461,6 +496,8 @@ impl AsyncRead for KcpStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
+        trace!("poll_read called");
+        
         if self.closed {
             return Poll::Ready(Ok(()));
         }
@@ -470,32 +507,45 @@ impl AsyncRead for KcpStream {
             let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
             buf.put_slice(&self.read_buf[..to_copy]);
             self.read_buf.advance(to_copy);
+            trace!("Returning {} bytes from buffer", to_copy);
             return Poll::Ready(Ok(()));
         }
 
         // Try to receive data from KCP
-        let engine = self.engine.clone();
-        let mut recv_future = Box::pin(async move {
-            let mut engine = engine.lock().await;
-            engine.recv().await
-        });
+        trace!("No data in buffer, trying to receive from KCP engine");
+        
+        // Try a few times to handle race conditions
+        for _ in 0..3 {
+            let engine = self.engine.clone();
+            let mut recv_future = Box::pin(async move {
+                let mut engine = engine.lock().await;
+                engine.recv().await
+            });
 
-        match recv_future.as_mut().poll(cx) {
-            Poll::Ready(Ok(Some(data))) => {
-                self.read_buf.extend_from_slice(&data);
-                let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
-                buf.put_slice(&self.read_buf[..to_copy]);
-                self.read_buf.advance(to_copy);
-                Poll::Ready(Ok(()))
+            match recv_future.as_mut().poll(cx) {
+                Poll::Ready(Ok(Some(data))) => {
+                    self.read_buf.extend_from_slice(&data);
+                    let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
+                    buf.put_slice(&self.read_buf[..to_copy]);
+                    self.read_buf.advance(to_copy);
+                    return Poll::Ready(Ok(()));
+                }
+                Poll::Ready(Ok(None)) => {
+                    // No data yet, try again
+                    continue;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+                Poll::Pending => {
+                    // Lock is held, wake and return
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
             }
-            Poll::Ready(Ok(None)) => {
-                // No data available, would block
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-            Poll::Ready(Err(e)) => Poll::Ready(Err(io::Error::other(e))),
-            Poll::Pending => Poll::Pending,
         }
+        
+        // No data after retries, wake for next poll
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
