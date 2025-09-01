@@ -1,13 +1,11 @@
-# Rust
-/target/
-Cargo.lock
+# Ignore all files and add necessary files
+*
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# OS
-.DS_Store
-Thumbs.db
+!.gitignore
+!*.toml
+!*.md
+!*.yaml
+!*.toml
+!*.proto
+!*.rs
+!.cargo

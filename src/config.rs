@@ -74,7 +74,7 @@ impl NodeDelayConfig {
     pub fn fast() -> Self {
         Self {
             nodelay: true,
-            interval: 10, // Reduced from 20ms for lower latency
+            interval: 8, // Further optimized from 10ms for even lower latency
             resend: 2,
             no_congestion_control: false,
         }
@@ -84,8 +84,18 @@ impl NodeDelayConfig {
     pub fn turbo() -> Self {
         Self {
             nodelay: true,
-            interval: 5, // Ultra-low latency, 5ms update interval
-            resend: 1,   // Faster resend
+            interval: 4, // Ultra-low latency, reduced to 4ms for maximum responsiveness
+            resend: 1,   // Immediate fast resend
+            no_congestion_control: true,
+        }
+    }
+
+    /// Gaming mode - specialized for real-time gaming with ultra-low jitter
+    pub fn gaming() -> Self {
+        Self {
+            nodelay: true,
+            interval: 3, // Extremely low latency for gaming
+            resend: 1,
             no_congestion_control: true,
         }
     }
@@ -238,14 +248,14 @@ impl KcpConfig {
 
 /// Preset configurations for common use cases
 impl KcpConfig {
-    /// Configuration optimized for games
+    /// Configuration optimized for games - ultra-responsive with minimal jitter
     pub fn gaming() -> Self {
         Self::default()
-            .turbo_mode()
-            .window_size(128, 128)
+            .nodelay_config(NodeDelayConfig::gaming())
+            .window_size(64, 128) // Smaller send window to reduce buffering delay
             .mtu(1200)
-            .connect_timeout(Duration::from_secs(5))
-            .keep_alive(Some(Duration::from_secs(15)))
+            .connect_timeout(Duration::from_secs(3))
+            .keep_alive(Some(Duration::from_secs(10)))
     }
 
     /// Configuration optimized for file transfers

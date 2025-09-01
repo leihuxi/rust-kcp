@@ -364,47 +364,81 @@ impl ConnectionManager {
 
     /// Start background tasks
     async fn start_background_tasks(&mut self) -> Result<()> {
-        // Update task
+        // Optimized update task with concurrent processing
         let connections = self.connections.clone();
         let update_interval = self.config.nodelay.interval;
 
         self.update_task = Some(tokio::spawn(async move {
             let mut interval = interval(Duration::from_millis(update_interval as u64));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 interval.tick().await;
 
-                let connections = connections.read().await;
-                for connection in connections.values() {
-                    if let Err(e) = connection.update().await {
-                        error!(
-                            conv = %connection.conv,
-                            error = %e,
-                            "Connection update failed"
-                        );
-                    }
+                // Get snapshot of connections to avoid holding read lock too long
+                let connection_list = {
+                    let connections = connections.read().await;
+                    connections.values().cloned().collect::<Vec<_>>()
+                };
+
+                // Process connections concurrently in small batches
+                const BATCH_SIZE: usize = 8;
+                for batch in connection_list.chunks(BATCH_SIZE) {
+                    let update_futures = batch.iter().map(|connection| {
+                        let conn = connection.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = conn.update().await {
+                                error!(
+                                    conv = %conn.conv,
+                                    error = %e,
+                                    "Connection update failed"
+                                );
+                            }
+                        })
+                    });
+
+                    // Wait for this batch to complete
+                    futures::future::join_all(update_futures).await;
                 }
             }
         }));
 
-        // Receive task
+        // Optimized receive task with better async performance
         let socket = self.socket.clone();
         let connections = self.connections.clone();
         let addr_to_conv = self.addr_to_conv.clone();
 
         self.receive_task = Some(tokio::spawn(async move {
+            // Pre-allocate larger buffer for better UDP performance
             let mut buf = vec![0u8; 65536];
+            const MAX_BATCH_SIZE: usize = 16; // Process multiple packets per iteration
+            let mut batch_buffer = Vec::with_capacity(MAX_BATCH_SIZE);
 
             loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((size, peer_addr)) => {
-                        let data = Bytes::copy_from_slice(&buf[..size]);
+                // Process up to MAX_BATCH_SIZE packets in one batch
+                for _ in 0..MAX_BATCH_SIZE {
+                    match socket.try_recv_from(&mut buf) {
+                        Ok((size, peer_addr)) => {
+                            let data = Bytes::copy_from_slice(&buf[..size]);
+                            batch_buffer.push((peer_addr, data));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(e) => {
+                            error!(error = %e, "UDP try_recv failed");
+                            break;
+                        }
+                    }
+                }
 
-                        // Find connection by peer address
-                        let addr_to_conv = addr_to_conv.read().await;
+                // Process batched packets
+                if !batch_buffer.is_empty() {
+                    let addr_to_conv = addr_to_conv.read().await;
+                    let connections = connections.read().await;
+
+                    for (peer_addr, data) in batch_buffer.drain(..) {
                         if let Some(&conv) = addr_to_conv.get(&peer_addr) {
-                            let connections = connections.read().await;
                             if let Some(connection) = connections.get(&conv) {
+                                // Use try_lock for better async performance
                                 if let Err(e) = connection.input(data).await {
                                     trace!(
                                         conv = %conv,
@@ -416,9 +450,32 @@ impl ConnectionManager {
                             }
                         }
                     }
-                    Err(e) => {
-                        error!(error = %e, "UDP receive failed");
-                        break;
+                } else {
+                    // No packets available, do blocking receive
+                    match socket.recv_from(&mut buf).await {
+                        Ok((size, peer_addr)) => {
+                            let data = Bytes::copy_from_slice(&buf[..size]);
+
+                            // Process single packet
+                            let addr_to_conv = addr_to_conv.read().await;
+                            if let Some(&conv) = addr_to_conv.get(&peer_addr) {
+                                let connections = connections.read().await;
+                                if let Some(connection) = connections.get(&conv) {
+                                    if let Err(e) = connection.input(data).await {
+                                        trace!(
+                                            conv = %conv,
+                                            peer = %peer_addr,
+                                            error = %e,
+                                            "Failed to process packet"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "UDP receive failed");
+                            break;
+                        }
                     }
                 }
             }

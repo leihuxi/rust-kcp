@@ -352,20 +352,23 @@ impl BufferPool {
 }
 
 lazy_static::lazy_static! {
-    // High-performance global buffer pools for different size classes
-    static ref SMALL_BUFFER_POOL: BufferPool = BufferPool::new(2000, 1024);   // For small packets
-    static ref MEDIUM_BUFFER_POOL: BufferPool = BufferPool::new(1000, 2048);  // For regular data
-    static ref LARGE_BUFFER_POOL: BufferPool = BufferPool::new(500, 8192);    // For fragmented data
+    // Optimized buffer pools with increased capacity and better size distribution
+    static ref SMALL_BUFFER_POOL: BufferPool = BufferPool::new(4000, 1024);   // 2x capacity for high-frequency small packets
+    static ref MEDIUM_BUFFER_POOL: BufferPool = BufferPool::new(2000, 1400);  // MTU-aligned for efficiency
+    static ref LARGE_BUFFER_POOL: BufferPool = BufferPool::new(1000, 8192);   // 2x capacity for bulk transfers
+    static ref JUMBO_BUFFER_POOL: BufferPool = BufferPool::new(200, 65536);   // New: for large fragmented messages
 }
 
 /// Get a buffer from the appropriate global pool based on size
 pub async fn get_buffer(size_hint: usize) -> BytesMut {
     if size_hint <= 1024 {
         SMALL_BUFFER_POOL.get().await
-    } else if size_hint <= 2048 {
+    } else if size_hint <= 1400 {
         MEDIUM_BUFFER_POOL.get().await
-    } else {
+    } else if size_hint <= 8192 {
         LARGE_BUFFER_POOL.get().await
+    } else {
+        JUMBO_BUFFER_POOL.get().await
     }
 }
 
@@ -373,10 +376,12 @@ pub async fn get_buffer(size_hint: usize) -> BytesMut {
 pub fn try_get_buffer(size_hint: usize) -> BytesMut {
     if size_hint <= 1024 {
         SMALL_BUFFER_POOL.try_get()
-    } else if size_hint <= 2048 {
+    } else if size_hint <= 1400 {
         MEDIUM_BUFFER_POOL.try_get()
-    } else {
+    } else if size_hint <= 8192 {
         LARGE_BUFFER_POOL.try_get()
+    } else {
+        JUMBO_BUFFER_POOL.try_get()
     }
 }
 
@@ -384,12 +389,13 @@ pub fn try_get_buffer(size_hint: usize) -> BytesMut {
 pub async fn put_buffer(buf: BytesMut) {
     let capacity = buf.capacity();
     if capacity <= 1536 {
-        // Allow some overhead
         SMALL_BUFFER_POOL.put(buf).await;
-    } else if capacity <= 3072 {
+    } else if capacity <= 2100 {
         MEDIUM_BUFFER_POOL.put(buf).await;
-    } else {
+    } else if capacity <= 12288 {
         LARGE_BUFFER_POOL.put(buf).await;
+    } else {
+        JUMBO_BUFFER_POOL.put(buf).await;
     }
 }
 
@@ -398,10 +404,12 @@ pub fn try_put_buffer(buf: BytesMut) {
     let capacity = buf.capacity();
     if capacity <= 1536 {
         SMALL_BUFFER_POOL.try_put(buf);
-    } else if capacity <= 3072 {
+    } else if capacity <= 2100 {
         MEDIUM_BUFFER_POOL.try_put(buf);
-    } else {
+    } else if capacity <= 12288 {
         LARGE_BUFFER_POOL.try_put(buf);
+    } else {
+        JUMBO_BUFFER_POOL.try_put(buf);
     }
 }
 
@@ -422,6 +430,11 @@ pub fn buffer_pool_stats() -> Vec<(&'static str, usize, usize)> {
             "large",
             LARGE_BUFFER_POOL.stats().0,
             LARGE_BUFFER_POOL.stats().1,
+        ),
+        (
+            "jumbo",
+            JUMBO_BUFFER_POOL.stats().0,
+            JUMBO_BUFFER_POOL.stats().1,
         ),
     ]
 }
