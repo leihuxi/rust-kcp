@@ -514,32 +514,26 @@ impl AsyncRead for KcpStream {
         // Try to receive data from KCP
         trace!("No data in buffer, trying to receive from KCP engine");
 
-        // Try a few times to handle race conditions
-        for _ in 0..3 {
-            let engine = self.engine.clone();
-            let mut recv_future = Box::pin(async move {
-                let mut engine = engine.lock().await;
-                engine.recv().await
-            });
+        let engine = self.engine.clone();
+        let mut recv_future = Box::pin(async move {
+            let mut engine = engine.lock().await;
+            engine.recv().await
+        });
 
-            match recv_future.as_mut().poll(cx) {
-                Poll::Ready(Ok(Some(data))) => {
-                    self.read_buf.extend_from_slice(&data);
-                    let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
-                    buf.put_slice(&self.read_buf[..to_copy]);
-                    self.read_buf.advance(to_copy);
-                    return Poll::Ready(Ok(()));
-                }
-                Poll::Ready(Ok(None)) => {
-                    // No data yet, try again
-                    continue;
-                }
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
-                Poll::Pending => {
-                    // Lock is held, wake and return
-                    cx.waker().wake_by_ref();
-                    return Poll::Pending;
-                }
+        match recv_future.as_mut().poll(cx) {
+            Poll::Ready(Ok(Some(data))) => {
+                self.read_buf.extend_from_slice(&data);
+                let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
+                buf.put_slice(&self.read_buf[..to_copy]);
+                self.read_buf.advance(to_copy);
+                return Poll::Ready(Ok(()));
+            }
+            Poll::Ready(Ok(None)) => {} // No data yet
+            Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+            Poll::Pending => {
+                // Lock is held, wake and return
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
             }
         }
 
