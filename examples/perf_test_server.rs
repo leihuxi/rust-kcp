@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 
 #[derive(Debug, Clone)]
 struct ServerStats {
-    connections: usize,
+    _connections: usize,
     total_messages: u64,
     total_bytes: u64,
     start_time: Instant,
@@ -27,7 +27,7 @@ struct ServerStats {
 impl ServerStats {
     fn new() -> Self {
         Self {
-            connections: 0,
+            _connections: 0,
             total_messages: 0,
             total_bytes: 0,
             start_time: Instant::now(),
@@ -96,7 +96,7 @@ async fn handle_client(
                 }
 
                 // Send stats update every 1000 messages
-                if message_count % 1000 == 0 {
+                if message_count.is_multiple_of(1000) {
                     let _ = stats_tx.send((message_count, byte_count));
 
                     let elapsed = start_time.elapsed().as_secs_f64();

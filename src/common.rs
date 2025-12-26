@@ -271,83 +271,59 @@ pub fn seq_after(seq1: SeqNum, seq2: SeqNum) -> bool {
     (seq1.wrapping_sub(seq2) as i32) > 0
 }
 
-/// High-performance buffer pool with lock-free design for better async performance
-#[derive(Debug)]
+/// High-performance lock-free buffer pool using crossbeam
 pub struct BufferPool {
-    pool: tokio::sync::Mutex<Vec<BytesMut>>,
-    max_size: usize,
+    pool: crossbeam::queue::ArrayQueue<BytesMut>,
     buffer_size: usize,
-    stats: std::sync::Arc<std::sync::atomic::AtomicUsize>, // Track pool hits
+    hits: std::sync::atomic::AtomicUsize,
 }
 
 impl BufferPool {
     /// Create a new buffer pool
     pub fn new(max_size: usize, buffer_size: usize) -> Self {
         Self {
-            pool: tokio::sync::Mutex::new(Vec::with_capacity(max_size)),
-            max_size,
+            pool: crossbeam::queue::ArrayQueue::new(max_size),
             buffer_size,
-            stats: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            hits: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
-    /// Get a buffer from the pool (async-friendly)
+    /// Get a buffer from the pool (async-friendly, but lock-free so no await needed)
     pub async fn get(&self) -> BytesMut {
-        let mut pool = self.pool.lock().await;
-        match pool.pop() {
+        self.try_get()
+    }
+
+    /// Get a buffer from the pool (lock-free)
+    pub fn try_get(&self) -> BytesMut {
+        match self.pool.pop() {
             Some(buf) => {
-                self.stats
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 buf
             }
             None => BytesMut::with_capacity(self.buffer_size),
         }
     }
 
-    /// Get a buffer from the pool (non-blocking for sync contexts)
-    pub fn try_get(&self) -> BytesMut {
-        match self.pool.try_lock() {
-            Ok(mut pool) => match pool.pop() {
-                Some(buf) => {
-                    self.stats
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    buf
-                }
-                None => BytesMut::with_capacity(self.buffer_size),
-            },
-            Err(_) => BytesMut::with_capacity(self.buffer_size),
-        }
+    /// Return a buffer to the pool (async-friendly, but lock-free so no await needed)
+    pub async fn put(&self, buf: BytesMut) {
+        self.try_put(buf);
     }
 
-    /// Return a buffer to the pool (async-friendly)
-    pub async fn put(&self, mut buf: BytesMut) {
-        // Only return buffers of appropriate size to avoid memory fragmentation
-        if buf.capacity() >= self.buffer_size / 2 && buf.capacity() <= self.buffer_size * 2 {
-            buf.clear();
-            let mut pool = self.pool.lock().await;
-            if pool.len() < self.max_size {
-                pool.push(buf);
-            }
-        }
-    }
-
-    /// Return a buffer to the pool (non-blocking for sync contexts)
+    /// Return a buffer to the pool (lock-free)
     pub fn try_put(&self, mut buf: BytesMut) {
+        // Only return buffers of appropriate size
         if buf.capacity() >= self.buffer_size / 2 && buf.capacity() <= self.buffer_size * 2 {
             buf.clear();
-            if let Ok(mut pool) = self.pool.try_lock() {
-                if pool.len() < self.max_size {
-                    pool.push(buf);
-                }
-            }
+            let _ = self.pool.push(buf); // Ignore if full
         }
     }
 
-    /// Get pool statistics
+    /// Get pool statistics (hits, current_size)
     pub fn stats(&self) -> (usize, usize) {
-        let hits = self.stats.load(std::sync::atomic::Ordering::Relaxed);
-        let current_size = self.pool.try_lock().map(|pool| pool.len()).unwrap_or(0);
-        (hits, current_size)
+        (
+            self.hits.load(std::sync::atomic::Ordering::Relaxed),
+            self.pool.len(),
+        )
     }
 }
 

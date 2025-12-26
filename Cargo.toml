@@ -20,20 +20,18 @@ tokio = ["dep:tokio", "dep:tokio-util"]
 tokio = { version = "1.0", features = ["full"], optional = true }
 tokio-util = { version = "0.7", optional = true }
 
-# Async traits and utilities
-futures = "0.3"
-pin-project-lite = "0.2"
-
 # Serialization and networking
 bytes = "1.0"
 thiserror = "1.0"
 
-# Metrics and monitoring
+# Logging
 tracing = "0.1"
-tracing-futures = "0.2"
 
 # Random number generation
 rand = "0.8"
+
+# Lock-free data structures
+crossbeam = "0.8"
 
 # Lazy static for global state
 lazy_static = "1.4"

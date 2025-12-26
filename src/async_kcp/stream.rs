@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::UdpSocket;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{error, info, trace};
 
@@ -28,7 +28,9 @@ pub struct KcpStream {
     // Read/write state
     read_buf: BytesMut,
     write_notify: Arc<Notify>,
-    read_notify: Arc<Notify>, // Notify when data is available to read
+    // Channel for receiving data from recv_task (replaces read_notify for proper async wakeup)
+    data_rx: mpsc::Receiver<Bytes>,
+    data_tx: mpsc::Sender<Bytes>,
 
     // Background tasks
     update_task: Option<tokio::task::JoinHandle<()>>,
@@ -59,10 +61,12 @@ impl KcpStream {
         peer_addr: SocketAddr,
         conv: ConvId,
         config: KcpConfig,
-        _is_client: bool,
     ) -> Result<Self> {
         let engine = KcpEngine::new(conv, config.clone());
         let engine = Arc::new(Mutex::new(engine));
+
+        // Create bounded channel for data transfer (backpressure at 256 messages)
+        let (data_tx, data_rx) = mpsc::channel(256);
 
         let mut stream = Self {
             engine: engine.clone(),
@@ -71,7 +75,8 @@ impl KcpStream {
             config,
             read_buf: crate::common::try_get_buffer(2048),
             write_notify: Arc::new(Notify::new()),
-            read_notify: Arc::new(Notify::new()),
+            data_rx,
+            data_tx,
             update_task: None,
             recv_task: None,
             connected: false,
@@ -119,9 +124,18 @@ impl KcpStream {
     pub async fn input_packet(&self, data: Bytes) -> Result<()> {
         let mut engine = self.engine.lock().await;
         engine.input(data).await?;
-        // Immediately process any pending output
         engine.update().await?;
+        Self::drain_recv_to_channel(&mut engine, &self.data_tx).await;
         Ok(())
+    }
+
+    /// Drain all complete messages from engine and send to channel
+    async fn drain_recv_to_channel(engine: &mut KcpEngine, tx: &mpsc::Sender<Bytes>) {
+        while let Ok(Some(msg)) = engine.recv().await {
+            if tx.try_send(msg).is_err() {
+                break;
+            }
+        }
     }
 
     /// Create a new server-side KCP stream (with proper routing)
@@ -137,6 +151,9 @@ impl KcpStream {
         let engine = KcpEngine::new(conv, config.clone());
         let engine = Arc::new(Mutex::new(engine));
 
+        // Create bounded channel for data transfer
+        let (data_tx, data_rx) = mpsc::channel(256);
+
         let mut stream = Self {
             engine: engine.clone(),
             socket: listener_socket.clone(),
@@ -144,7 +161,8 @@ impl KcpStream {
             config,
             read_buf: crate::common::try_get_buffer(2048),
             write_notify: Arc::new(Notify::new()),
-            read_notify: Arc::new(Notify::new()),
+            data_rx,
+            data_tx,
             update_task: None,
             recv_task: None,
             connected: false,
@@ -175,6 +193,9 @@ impl KcpStream {
             // Force an update to send ACK/response
             engine.update().await?;
             engine.flush().await?;
+
+            // Drain any complete messages from initial packet
+            Self::drain_recv_to_channel(&mut engine, &stream.data_tx).await;
         }
 
         // Start only update task for server stream
@@ -196,14 +217,16 @@ impl KcpStream {
         is_client: bool,
     ) -> Result<Self> {
         let conv = if is_client {
-            // Use fixed conversation ID for C server compatibility
-            0x12345678u32
+            0x12345678u32 // Fixed conversation ID for C server compatibility
         } else {
-            // Server will use the conversation ID from the first packet
-            0
+            0 // Server will use the conversation ID from the first packet
         };
+        Self::new_with_conv(socket, peer_addr, conv, config).await
+    }
 
-        Self::new_with_conv(socket, peer_addr, conv, config, is_client).await
+    /// Get a clone of the data sender channel (for listener packet routing)
+    pub(crate) fn data_sender(&self) -> tokio::sync::mpsc::Sender<Bytes> {
+        self.data_tx.clone()
     }
 
     /// Send data through the KCP stream
@@ -211,13 +234,8 @@ impl KcpStream {
         if self.closed {
             return Err(KcpError::connection(ConnectionError::Closed));
         }
-
-        let bytes = Bytes::copy_from_slice(data);
-        let mut engine = self.engine.lock().await;
-        engine.send(bytes).await?;
-        // Immediately flush the data
+        self.engine.lock().await.send(Bytes::copy_from_slice(data)).await?;
         self.write_notify.notify_one();
-
         Ok(())
     }
 
@@ -226,9 +244,7 @@ impl KcpStream {
         if self.closed {
             return Ok(None);
         }
-
-        let mut engine = self.engine.lock().await;
-        engine.recv().await
+        self.engine.lock().await.recv().await
     }
 
     /// Get local address
@@ -249,12 +265,7 @@ impl KcpStream {
 
     /// Check if the connection is alive
     pub async fn is_connected(&self) -> bool {
-        if !self.connected || self.closed {
-            return false;
-        }
-
-        let engine = self.engine.lock().await;
-        !engine.is_dead()
+        self.connected && !self.closed && !self.engine.lock().await.is_dead()
     }
 
     /// Close the stream gracefully
@@ -262,30 +273,29 @@ impl KcpStream {
         if self.closed {
             return Ok(());
         }
-
         self.closed = true;
-
-        // Cancel background tasks
-        if let Some(task) = self.update_task.take() {
-            task.abort();
-        }
-
-        if let Some(task) = self.recv_task.take() {
-            task.abort();
-        }
-
+        self.abort_tasks();
         info!(peer = %self.peer_addr, "KCP stream closed");
         Ok(())
     }
 
-    /// Start background tasks for unconnected socket (server side)
-    async fn start_background_tasks_unconnected(&mut self) -> Result<()> {
-        let engine = self.engine.clone();
-        let write_notify = self.write_notify.clone();
-        let update_interval = self.config.nodelay.interval;
+    /// Abort background tasks
+    fn abort_tasks(&mut self) {
+        if let Some(task) = self.update_task.take() {
+            task.abort();
+        }
+        if let Some(task) = self.recv_task.take() {
+            task.abort();
+        }
+    }
 
-        // Update task - periodically calls engine.update()
-        self.update_task = Some(tokio::spawn(async move {
+    /// Spawn the update task
+    fn spawn_update_task(
+        engine: Arc<Mutex<KcpEngine>>,
+        write_notify: Arc<Notify>,
+        update_interval: u32,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
             let mut interval = interval(std::time::Duration::from_millis(update_interval as u64));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -299,9 +309,7 @@ impl KcpStream {
                         }
                     }
                     _ = write_notify.notified() => {
-                        // Flush immediately when notified of new data
                         let mut engine = engine.lock().await;
-                        // Just call flush - it already does everything needed to send data
                         if let Err(e) = engine.flush().await {
                             error!(error = %e, "Engine flush failed");
                             break;
@@ -309,115 +317,44 @@ impl KcpStream {
                     }
                 }
             }
-        }));
-
-        // Receive task - receives UDP packets from any source and filters by peer_addr
-        let engine = self.engine.clone();
-        let socket = self.socket.clone();
-        let expected_peer = self.peer_addr;
-
-        self.recv_task = Some(tokio::spawn(async move {
-            let mut buf = vec![0u8; 65536];
-
-            loop {
-                match socket.recv_from(&mut buf).await {
-                    Ok((size, src_addr)) => {
-                        // Only process packets from our peer
-                        if src_addr == expected_peer {
-                            let data = Bytes::copy_from_slice(&buf[..size]);
-                            let mut engine = engine.lock().await;
-                            if let Err(e) = engine.input(data).await {
-                                trace!(error = %e, "Failed to process packet");
-                                // Continue processing other packets
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, "UDP receive failed");
-                        break;
-                    }
-                }
-            }
-        }));
-
-        Ok(())
+        })
     }
 
     /// Start background tasks for update and packet receiving
     async fn start_background_tasks(&mut self) -> Result<()> {
-        let engine = self.engine.clone();
-        let write_notify = self.write_notify.clone();
-        let update_interval = self.config.nodelay.interval;
+        self.update_task = Some(Self::spawn_update_task(
+            self.engine.clone(),
+            self.write_notify.clone(),
+            self.config.nodelay.interval,
+        ));
 
-        // Update task - periodically calls engine.update()
-        self.update_task = Some(tokio::spawn(async move {
-            let mut interval = interval(std::time::Duration::from_millis(update_interval as u64));
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let mut engine = engine.lock().await;
-                        if let Err(e) = engine.update().await {
-                            error!(error = %e, "Engine update failed");
-                            break;
-                        }
-                    }
-                    _ = write_notify.notified() => {
-                        // Flush immediately when notified of new data
-                        let mut engine = engine.lock().await;
-                        // Just call flush - it already does everything needed to send data
-                        if let Err(e) = engine.flush().await {
-                            error!(error = %e, "Engine flush failed");
-                            break;
-                        }
-                    }
-                }
-            }
-        }));
-
-        // Receive task - receives UDP packets and feeds them to engine
+        // Receive task - receives UDP packets, processes them, and sends data via channel
         let engine = self.engine.clone();
         let socket = self.socket.clone();
-        let read_notify = self.read_notify.clone();
+        let data_tx = self.data_tx.clone();
 
         trace!("Starting receive task");
 
         self.recv_task = Some(tokio::spawn(async move {
-            // Pre-allocate buffer once to avoid repeated allocations
             let mut buf = vec![0u8; 65536];
 
             loop {
                 match socket.recv(&mut buf).await {
                     Ok(size) => {
-                        // Use slice directly without copying when possible
                         let data = Bytes::copy_from_slice(&buf[..size]);
+                        let mut engine = engine.lock().await;
 
-                        // Try to get lock without blocking to reduce contention
-                        let processed = match engine.try_lock() {
-                            Ok(mut guard) => {
-                                if let Err(e) = guard.input(data.clone()).await {
-                                    trace!(error = %e, "Failed to process packet");
-                                    false
-                                } else {
-                                    true
-                                }
-                            }
-                            Err(_) => {
-                                // Lock is busy, fall back to async lock
-                                let mut guard = engine.lock().await;
-                                if let Err(e) = guard.input(data).await {
-                                    trace!(error = %e, "Failed to process packet");
-                                    false
-                                } else {
-                                    true
-                                }
-                            }
-                        };
+                        if let Err(e) = engine.input(data).await {
+                            trace!(error = %e, "Failed to process packet");
+                            continue;
+                        }
 
-                        // Only notify if packet was processed successfully
-                        if processed {
-                            read_notify.notify_one();
+                        // Drain complete messages to channel
+                        while let Ok(Some(msg)) = engine.recv().await {
+                            if data_tx.send(msg).await.is_err() {
+                                trace!("Data channel closed, stopping recv task");
+                                return;
+                            }
                         }
                     }
                     Err(e) => {
@@ -433,55 +370,22 @@ impl KcpStream {
 
     /// Start only the update task (for server streams)
     async fn start_update_task_only(&mut self) -> Result<()> {
-        let engine = self.engine.clone();
-        let write_notify = self.write_notify.clone();
-        let update_interval = self.config.nodelay.interval;
-
-        // Update task - periodically calls engine.update()
-        self.update_task = Some(tokio::spawn(async move {
-            let mut interval = interval(std::time::Duration::from_millis(update_interval as u64));
-            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        let mut engine = engine.lock().await;
-                        if let Err(e) = engine.update().await {
-                            error!(error = %e, "Engine update failed");
-                            break;
-                        }
-                    }
-                    _ = write_notify.notified() => {
-                        // Flush immediately when notified of new data
-                        let mut engine = engine.lock().await;
-                        // Just call flush - it already does everything needed to send data
-                        if let Err(e) = engine.flush().await {
-                            error!(error = %e, "Engine flush failed");
-                            break;
-                        }
-                    }
-                }
-            }
-        }));
-
+        self.update_task = Some(Self::spawn_update_task(
+            self.engine.clone(),
+            self.write_notify.clone(),
+            self.config.nodelay.interval,
+        ));
         Ok(())
     }
 }
 
 impl Drop for KcpStream {
     fn drop(&mut self) {
-        // Cancel background tasks
-        if let Some(task) = self.update_task.take() {
-            task.abort();
-        }
-
-        if let Some(task) = self.recv_task.take() {
-            task.abort();
-        }
+        self.abort_tasks();
 
         // Return read buffer to pool for memory efficiency
         if !self.read_buf.is_empty() {
-            let mut buf = std::mem::replace(&mut self.read_buf, BytesMut::new());
+            let mut buf = std::mem::take(&mut self.read_buf);
             buf.clear();
             crate::common::try_put_buffer(buf);
         }
@@ -501,7 +405,7 @@ impl AsyncRead for KcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Check if we have data in our buffer
+        // Check if we have data in our buffer first
         if !self.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
             buf.put_slice(&self.read_buf[..to_copy]);
@@ -510,35 +414,32 @@ impl AsyncRead for KcpStream {
             return Poll::Ready(Ok(()));
         }
 
-        // Try to receive data from KCP
-        trace!("No data in buffer, trying to receive from KCP engine");
+        // Try to receive data from channel (sent by recv_task)
+        trace!("No data in buffer, polling channel for data");
 
-        let engine = self.engine.clone();
-        let mut recv_future = Box::pin(async move {
-            let mut engine = engine.lock().await;
-            engine.recv().await
-        });
-
-        match recv_future.as_mut().poll(cx) {
-            Poll::Ready(Ok(Some(data))) => {
+        // Poll the channel receiver - this properly registers waker
+        match Pin::new(&mut self.data_rx).poll_recv(cx) {
+            Poll::Ready(Some(data)) => {
+                // Got data from recv_task
                 self.read_buf.extend_from_slice(&data);
                 let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
                 buf.put_slice(&self.read_buf[..to_copy]);
                 self.read_buf.advance(to_copy);
-                return Poll::Ready(Ok(()));
+                trace!("Received {} bytes from channel", to_copy);
+                Poll::Ready(Ok(()))
             }
-            Poll::Ready(Ok(None)) => {} // No data yet
-            Poll::Ready(Err(e)) => return Poll::Ready(Err(io::Error::other(e))),
+            Poll::Ready(None) => {
+                // Channel closed - recv_task has stopped
+                trace!("Data channel closed");
+                Poll::Ready(Ok(())) // EOF
+            }
             Poll::Pending => {
-                // Lock is held, wake and return
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
+                // No data yet, waker is registered by poll_recv
+                // Will be woken when recv_task sends data
+                trace!("No data available, waiting for recv_task");
+                Poll::Pending
             }
         }
-
-        // No data after retries, wake for next poll
-        cx.waker().wake_by_ref();
-        Poll::Pending
     }
 }
 

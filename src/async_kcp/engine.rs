@@ -5,76 +5,82 @@ use crate::config::KcpConfig;
 use crate::error::{ConnectionError, KcpError, Result};
 
 use bytes::Bytes;
-use futures::future::BoxFuture;
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
-use tokio::time::{interval, Interval};
 use tracing::{info, trace, warn};
 
 /// Output function type for sending packets
-pub type OutputFn = Arc<dyn Fn(Bytes) -> BoxFuture<'static, Result<()>> + Send + Sync>;
+pub type OutputFn = Arc<dyn Fn(Bytes) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> + Send + Sync>;
+
+/// RTT calculation state
+#[derive(Debug, Default)]
+struct RttState {
+    avg: u32,      // Smoothed RTT
+    var: u32,      // RTT variance
+    rto: u32,      // Retransmission timeout
+    min_rto: u32,  // Minimum RTO
+}
+
+/// Window control state
+#[derive(Debug)]
+struct WindowState {
+    snd: u32,      // Send window size
+    rcv: u32,      // Receive window size
+    rmt: u32,      // Remote window size
+    cwnd: u32,     // Congestion window
+    ssthresh: u32, // Slow start threshold
+    incr: u32,     // Increment for congestion avoidance
+}
+
+/// Probe state for window probing
+#[derive(Debug, Default)]
+struct ProbeState {
+    flags: u32,
+    wait: u32,
+    ts: Timestamp,
+}
 
 /// Async KCP engine implementing the core protocol logic
 pub struct KcpEngine {
-    // Core state
+    // Core
     conv: ConvId,
     config: KcpConfig,
 
     // Sequence numbers
-    snd_una: SeqNum, // Unacknowledged sequence number
-    snd_nxt: SeqNum, // Next sequence number to send
-    rcv_nxt: SeqNum, // Next expected receive sequence number
+    snd_una: SeqNum,
+    snd_nxt: SeqNum,
+    rcv_nxt: SeqNum,
 
-    // RTT and timing
-    rtt_avg: u32,
-    rtt_var: u32,
-    rto: u32,
-    min_rto: u32,
+    // Timing and window
+    rtt: RttState,
+    wnd: WindowState,
+    probe: ProbeState,
 
-    // Window control
-    snd_wnd: u32,  // Send window size
-    rcv_wnd: u32,  // Receive window size
-    rmt_wnd: u32,  // Remote window size
-    cwnd: u32,     // Congestion window
-    ssthresh: u32, // Slow start threshold
+    // Buffers
+    snd_queue: VecDeque<KcpSegment>,
+    rcv_queue: VecDeque<KcpSegment>,
+    snd_buf: VecDeque<KcpSegment>,
+    rcv_buf: VecDeque<KcpSegment>,
+    ack_list: Vec<(SeqNum, Timestamp)>,
 
-    // Queues and buffers
-    snd_queue: VecDeque<KcpSegment>, // Send queue
-    rcv_queue: VecDeque<KcpSegment>, // Receive queue
-    snd_buf: VecDeque<KcpSegment>,   // Send buffer (in flight)
-    rcv_buf: VecDeque<KcpSegment>,   // Receive buffer (out of order)
-
-    // ACK management
-    ack_list: Vec<(SeqNum, Timestamp)>, // Pending ACKs
-
-    // Probe state
-    probe: u32,
-    probe_wait: u32,
-    probe_ts: Timestamp,
-
-    // Statistics
+    // State
     stats: KcpStats,
-
-    // Output function
     output: Option<OutputFn>,
-
-    // Update timer
-    update_timer: Option<Interval>,
     last_update: Timestamp,
-
-    // Dead link detection
     dead_link: u32,
     xmit_count: u32,
-
-    // Flow control
-    incr: u32,
 }
 
 impl KcpEngine {
     /// Create a new KCP engine
     pub fn new(conv: ConvId, config: KcpConfig) -> Self {
-        let nodelay = &config.nodelay;
+        let min_rto = if config.nodelay.nodelay {
+            constants::IKCP_RTO_NDL
+        } else {
+            constants::IKCP_RTO_MIN
+        };
 
         Self {
             conv,
@@ -82,40 +88,35 @@ impl KcpEngine {
             snd_nxt: 0,
             rcv_nxt: 0,
 
-            rtt_avg: 0,
-            rtt_var: 0,
-            rto: constants::IKCP_RTO_DEF,
-            min_rto: if nodelay.nodelay {
-                constants::IKCP_RTO_NDL
-            } else {
-                constants::IKCP_RTO_MIN
+            rtt: RttState {
+                avg: 0,
+                var: 0,
+                rto: constants::IKCP_RTO_DEF,
+                min_rto,
             },
 
-            snd_wnd: config.snd_wnd,
-            rcv_wnd: config.rcv_wnd,
-            rmt_wnd: constants::IKCP_WND_RCV,
-            cwnd: config.snd_wnd,
-            ssthresh: constants::IKCP_THRESH_INIT,
+            wnd: WindowState {
+                snd: config.snd_wnd,
+                rcv: config.rcv_wnd,
+                rmt: constants::IKCP_WND_RCV,
+                cwnd: config.snd_wnd,
+                ssthresh: constants::IKCP_THRESH_INIT,
+                incr: 0,
+            },
+
+            probe: ProbeState::default(),
 
             snd_queue: VecDeque::new(),
             rcv_queue: VecDeque::new(),
             snd_buf: VecDeque::new(),
             rcv_buf: VecDeque::new(),
-
             ack_list: Vec::new(),
-
-            probe: 0,
-            probe_wait: 0,
-            probe_ts: 0,
 
             stats: KcpStats::default(),
             output: None,
-            update_timer: None,
             last_update: current_timestamp(),
-
             dead_link: constants::IKCP_DEADLINK,
             xmit_count: 0,
-            incr: 0,
 
             config,
         }
@@ -126,11 +127,8 @@ impl KcpEngine {
         self.output = Some(output);
     }
 
-    /// Start the engine with periodic updates
+    /// Start the engine
     pub async fn start(&mut self) -> Result<()> {
-        let timer = interval(Duration::from_millis(self.config.nodelay.interval as u64));
-        self.update_timer = Some(timer);
-
         info!(conv = %self.conv, "KCP engine started");
         Ok(())
     }
@@ -141,7 +139,7 @@ impl KcpEngine {
             return Ok(());
         }
 
-        let mss = self.config.mtu - constants::IKCP_OVERHEAD;
+        let mss = self.mss();
         let count = if data.len() <= mss as usize {
             1
         } else {
@@ -202,7 +200,7 @@ impl KcpEngine {
         let mut recovered = false;
 
         // Check if we were window-limited before
-        if self.rcv_queue.len() >= self.rcv_wnd as usize {
+        if self.rcv_queue.len() >= self.wnd.rcv as usize {
             recovered = true;
         }
 
@@ -229,8 +227,8 @@ impl KcpEngine {
         self.move_to_recv_queue();
 
         // Trigger window update if we recovered space
-        if recovered && self.rcv_queue.len() < self.rcv_wnd as usize {
-            self.probe |= constants::IKCP_ASK_TELL;
+        if recovered && self.rcv_queue.len() < self.wnd.rcv as usize {
+            self.probe.flags |= constants::IKCP_ASK_TELL;
         }
 
         trace!(
@@ -277,7 +275,7 @@ impl KcpEngine {
             }
 
             // Update remote window
-            self.rmt_wnd = segment.header.wnd as u32;
+            self.wnd.rmt = segment.header.wnd as u32;
 
             // Process UNA (unacknowledged sequence number)
             self.parse_una(segment.header.una);
@@ -306,7 +304,7 @@ impl KcpEngine {
 
                 constants::IKCP_CMD_PUSH => {
                     // Process data segment
-                    if seq_before(segment.header.sn, self.rcv_nxt + self.rcv_wnd) {
+                    if seq_before(segment.header.sn, self.rcv_nxt + self.wnd.rcv) {
                         // Add ACK
                         self.ack_push(segment.header.sn, segment.header.ts);
 
@@ -318,7 +316,7 @@ impl KcpEngine {
 
                 constants::IKCP_CMD_WASK => {
                     // Window probe request
-                    self.probe |= constants::IKCP_ASK_TELL;
+                    self.probe.flags |= constants::IKCP_ASK_TELL;
                 }
 
                 constants::IKCP_CMD_WINS => {
@@ -465,7 +463,7 @@ impl KcpEngine {
     fn parse_data(&mut self, newseg: KcpSegment) {
         let sn = newseg.header.sn;
 
-        if !seq_before(sn, self.rcv_nxt + self.rcv_wnd) || seq_before(sn, self.rcv_nxt) {
+        if !seq_before(sn, self.rcv_nxt + self.wnd.rcv) || seq_before(sn, self.rcv_nxt) {
             return;
         }
 
@@ -499,7 +497,7 @@ impl KcpEngine {
 
     fn move_to_recv_queue(&mut self) {
         while let Some(segment) = self.rcv_buf.front() {
-            if segment.header.sn == self.rcv_nxt && self.rcv_queue.len() < self.rcv_wnd as usize {
+            if segment.header.sn == self.rcv_nxt && self.rcv_queue.len() < self.wnd.rcv as usize {
                 let segment = self.rcv_buf.pop_front().unwrap();
                 self.rcv_queue.push_back(segment);
                 self.rcv_nxt += 1;
@@ -514,30 +512,30 @@ impl KcpEngine {
     }
 
     fn update_ack(&mut self, rtt: i32) {
-        if self.rtt_avg == 0 {
-            self.rtt_avg = rtt as u32;
-            self.rtt_var = rtt as u32 / 2;
+        if self.rtt.avg == 0 {
+            self.rtt.avg = rtt as u32;
+            self.rtt.var = rtt as u32 / 2;
         } else {
-            let delta = if rtt > self.rtt_avg as i32 {
-                rtt - self.rtt_avg as i32
+            let delta = if rtt > self.rtt.avg as i32 {
+                rtt - self.rtt.avg as i32
             } else {
-                self.rtt_avg as i32 - rtt
+                self.rtt.avg as i32 - rtt
             };
 
-            self.rtt_var = (3 * self.rtt_var + delta as u32) / 4;
-            self.rtt_avg = (7 * self.rtt_avg + rtt as u32) / 8;
+            self.rtt.var = (3 * self.rtt.var + delta as u32) / 4;
+            self.rtt.avg = (7 * self.rtt.avg + rtt as u32) / 8;
 
-            if self.rtt_avg < 1 {
-                self.rtt_avg = 1;
+            if self.rtt.avg < 1 {
+                self.rtt.avg = 1;
             }
         }
 
-        let rto = self.rtt_avg + 4 * self.rtt_var.max(self.config.nodelay.interval);
-        self.rto = rto.clamp(self.min_rto, constants::IKCP_RTO_MAX);
+        let rto = self.rtt.avg + 4 * self.rtt.var.max(self.config.nodelay.interval);
+        self.rtt.rto = rto.clamp(self.rtt.min_rto, constants::IKCP_RTO_MAX);
 
-        self.stats.rtt = self.rtt_avg;
-        self.stats.rtt_var = self.rtt_var;
-        self.stats.rto = self.rto;
+        self.stats.rtt = self.rtt.avg;
+        self.stats.rtt_var = self.rtt.var;
+        self.stats.rto = self.rtt.rto;
     }
 
     fn shrink_buf(&mut self) {
@@ -572,51 +570,47 @@ impl KcpEngine {
     }
 
     async fn handle_window_probe(&mut self, current: Timestamp) -> Result<()> {
-        if self.rmt_wnd == 0 {
-            if self.probe_wait == 0 {
-                self.probe_wait = constants::IKCP_PROBE_INIT;
-                self.probe_ts = current + self.probe_wait;
-            } else if time_diff(current, self.probe_ts) >= 0 {
-                if self.probe_wait < constants::IKCP_PROBE_INIT {
-                    self.probe_wait = constants::IKCP_PROBE_INIT;
+        if self.wnd.rmt == 0 {
+            if self.probe.wait == 0 {
+                self.probe.wait = constants::IKCP_PROBE_INIT;
+                self.probe.ts = current + self.probe.wait;
+            } else if time_diff(current, self.probe.ts) >= 0 {
+                if self.probe.wait < constants::IKCP_PROBE_INIT {
+                    self.probe.wait = constants::IKCP_PROBE_INIT;
                 }
-                self.probe_wait += self.probe_wait / 2;
-                if self.probe_wait > constants::IKCP_PROBE_LIMIT {
-                    self.probe_wait = constants::IKCP_PROBE_LIMIT;
+                self.probe.wait += self.probe.wait / 2;
+                if self.probe.wait > constants::IKCP_PROBE_LIMIT {
+                    self.probe.wait = constants::IKCP_PROBE_LIMIT;
                 }
-                self.probe_ts = current + self.probe_wait;
-                self.probe |= constants::IKCP_ASK_SEND;
+                self.probe.ts = current + self.probe.wait;
+                self.probe.flags |= constants::IKCP_ASK_SEND;
             }
         } else {
-            self.probe_ts = 0;
-            self.probe_wait = 0;
+            self.probe.ts = 0;
+            self.probe.wait = 0;
         }
 
         // Send probe packets
-        if (self.probe & constants::IKCP_ASK_SEND) != 0 {
-            let mut segment = KcpSegment::new(self.conv, constants::IKCP_CMD_WASK, Bytes::new());
-            segment.header.wnd = self.wnd_unused() as u16;
-            segment.header.una = self.rcv_nxt;
+        if (self.probe.flags & constants::IKCP_ASK_SEND) != 0 {
+            let segment = self.create_probe_segment(constants::IKCP_CMD_WASK);
             self.output_segment(segment, current).await?;
         }
 
-        if (self.probe & constants::IKCP_ASK_TELL) != 0 {
-            let mut segment = KcpSegment::new(self.conv, constants::IKCP_CMD_WINS, Bytes::new());
-            segment.header.wnd = self.wnd_unused() as u16;
-            segment.header.una = self.rcv_nxt;
+        if (self.probe.flags & constants::IKCP_ASK_TELL) != 0 {
+            let segment = self.create_probe_segment(constants::IKCP_CMD_WINS);
             self.output_segment(segment, current).await?;
         }
 
-        self.probe = 0;
+        self.probe.flags = 0;
         Ok(())
     }
 
     fn move_to_send_buf(&mut self, current: Timestamp) {
-        let cwnd = std::cmp::min(self.snd_wnd, self.rmt_wnd);
+        let cwnd = std::cmp::min(self.wnd.snd, self.wnd.rmt);
         let cwnd = if self.config.nodelay.no_congestion_control {
             cwnd
         } else {
-            std::cmp::min(self.cwnd, cwnd)
+            std::cmp::min(self.wnd.cwnd, cwnd)
         };
 
         while time_diff(self.snd_nxt, self.snd_una + cwnd) < 0 {
@@ -628,7 +622,7 @@ impl KcpEngine {
                 segment.header.sn = self.snd_nxt;
                 segment.header.una = self.rcv_nxt;
                 segment.resendts = current;
-                segment.rto = self.rto;
+                segment.rto = self.rtt.rto;
                 segment.fastack = 0;
                 segment.xmit = 0;
 
@@ -650,7 +644,7 @@ impl KcpEngine {
         let rtomin = if self.config.nodelay.nodelay {
             0
         } else {
-            self.rto / 8
+            self.rtt.rto / 8
         };
 
         let mut lost = false;
@@ -668,7 +662,7 @@ impl KcpEngine {
                 // First transmission
                 needsend = true;
                 segment.xmit = 1;
-                segment.rto = self.rto;
+                segment.rto = self.rtt.rto;
                 segment.resendts = current + segment.rto + rtomin;
             } else if time_diff(current, segment.resendts) >= 0 {
                 // Timeout retransmission
@@ -678,7 +672,7 @@ impl KcpEngine {
 
                 if self.config.nodelay.nodelay {
                     let step = if self.config.nodelay.no_congestion_control {
-                        self.rto
+                        self.rtt.rto
                     } else {
                         segment.rto
                     };
@@ -723,78 +717,96 @@ impl KcpEngine {
         // Update congestion control state
         if change {
             let inflight = self.snd_nxt - self.snd_una;
-            self.ssthresh = inflight / 2;
-            if self.ssthresh < constants::IKCP_THRESH_MIN {
-                self.ssthresh = constants::IKCP_THRESH_MIN;
+            self.wnd.ssthresh = inflight / 2;
+            if self.wnd.ssthresh < constants::IKCP_THRESH_MIN {
+                self.wnd.ssthresh = constants::IKCP_THRESH_MIN;
             }
-            self.cwnd = self.ssthresh + resend;
-            self.incr = self.cwnd * (self.config.mtu - constants::IKCP_OVERHEAD);
+            self.wnd.cwnd = self.wnd.ssthresh + resend;
+            self.wnd.incr = self.wnd.cwnd * self.mss();
         }
 
         if lost {
-            self.ssthresh = std::cmp::max(self.cwnd / 2, constants::IKCP_THRESH_MIN);
-            self.cwnd = 1;
-            self.incr = self.config.mtu - constants::IKCP_OVERHEAD;
+            self.wnd.ssthresh = std::cmp::max(self.wnd.cwnd / 2, constants::IKCP_THRESH_MIN);
+            self.reset_cwnd();
         }
 
-        if self.cwnd < 1 {
-            self.cwnd = 1;
-            self.incr = self.config.mtu - constants::IKCP_OVERHEAD;
+        if self.wnd.cwnd < 1 {
+            self.reset_cwnd();
         }
 
         Ok(())
     }
 
     fn update_cwnd(&mut self) {
-        if time_diff(self.snd_una, self.cwnd) > 0 && self.cwnd < self.rmt_wnd {
-            let mss = self.config.mtu - constants::IKCP_OVERHEAD;
-            if self.cwnd < self.ssthresh {
-                self.cwnd += 1;
-                self.incr += mss;
+        if time_diff(self.snd_una, self.wnd.cwnd) > 0 && self.wnd.cwnd < self.wnd.rmt {
+            let mss = self.mss();
+            if self.wnd.cwnd < self.wnd.ssthresh {
+                self.wnd.cwnd += 1;
+                self.wnd.incr += mss;
             } else {
-                if self.incr < mss {
-                    self.incr = mss;
+                if self.wnd.incr < mss {
+                    self.wnd.incr = mss;
                 }
-                self.incr += (mss * mss) / self.incr + (mss / 16);
-                if (self.cwnd + 1) * mss <= self.incr {
-                    self.cwnd = if mss > 0 { self.incr.div_ceil(mss) } else { 1 };
+                self.wnd.incr += (mss * mss) / self.wnd.incr + (mss / 16);
+                if (self.wnd.cwnd + 1) * mss <= self.wnd.incr {
+                    self.wnd.cwnd = if mss > 0 { self.wnd.incr.div_ceil(mss) } else { 1 };
                 }
             }
-            if self.cwnd > self.rmt_wnd {
-                self.cwnd = self.rmt_wnd;
-                self.incr = self.rmt_wnd * mss;
+            if self.wnd.cwnd > self.wnd.rmt {
+                self.wnd.cwnd = self.wnd.rmt;
+                self.wnd.incr = self.wnd.rmt * mss;
             }
         }
     }
 
     fn update_congestion_control(&mut self) {
         // Update statistics
-        self.stats.snd_wnd = self.snd_wnd;
-        self.stats.rcv_wnd = self.rcv_wnd;
-        self.stats.cwnd = self.cwnd;
+        self.stats.snd_wnd = self.wnd.snd;
+        self.stats.rcv_wnd = self.wnd.rcv;
+        self.stats.cwnd = self.wnd.cwnd;
         self.stats.snd_buf_size = self.snd_buf.len() as u32;
         self.stats.rcv_buf_size = self.rcv_buf.len() as u32;
     }
 
-    async fn output_segment(&self, segment: KcpSegment, _current: Timestamp) -> Result<()> {
+    async fn output_segment(&mut self, segment: KcpSegment, _current: Timestamp) -> Result<()> {
         if let Some(ref output) = self.output {
             let mut buf = crate::common::try_get_buffer(segment.size());
             segment.encode(&mut buf);
 
             output(buf.freeze()).await?;
 
-            // Update statistics
-            // self.stats.packets_sent += 1; // Would need &mut self
+            self.stats.packets_sent += 1;
         }
 
         Ok(())
     }
 
     fn wnd_unused(&self) -> u32 {
-        if self.rcv_queue.len() < self.rcv_wnd as usize {
-            self.rcv_wnd - self.rcv_queue.len() as u32
+        if self.rcv_queue.len() < self.wnd.rcv as usize {
+            self.wnd.rcv - self.rcv_queue.len() as u32
         } else {
             0
         }
+    }
+
+    /// Maximum segment size (MTU - overhead)
+    #[inline]
+    fn mss(&self) -> u32 {
+        self.config.mtu - constants::IKCP_OVERHEAD
+    }
+
+    /// Reset congestion window to initial state
+    #[inline]
+    fn reset_cwnd(&mut self) {
+        self.wnd.cwnd = 1;
+        self.wnd.incr = self.mss();
+    }
+
+    /// Create a probe segment with common fields set
+    fn create_probe_segment(&self, cmd: u8) -> KcpSegment {
+        let mut segment = KcpSegment::new(self.conv, cmd, Bytes::new());
+        segment.header.wnd = self.wnd_unused() as u16;
+        segment.header.una = self.rcv_nxt;
+        segment
     }
 }

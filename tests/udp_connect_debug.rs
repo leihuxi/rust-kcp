@@ -23,15 +23,15 @@ async fn test_udp_connected_client_pattern() {
             Ok(Ok((size, peer_addr))) => {
                 let msg = std::str::from_utf8(&buf[..size]).unwrap_or("<invalid>");
                 println!("Server: Received '{}' from {}", msg, peer_addr);
-                return true; // Success
+                true// Success
             }
             Ok(Err(e)) => {
                 println!("Server: recv_from error: {}", e);
-                return false;
+                false
             }
             Err(_) => {
                 println!("Server: recv_from timed out after 3 seconds");
-                return false;
+                false
             }
         }
     });

@@ -2,7 +2,7 @@ use kcp_tokio::async_kcp::{KcpListener, KcpStream};
 use kcp_tokio::config::KcpConfig;
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, info};
+use tracing::info;
 
 #[tokio::test]
 async fn test_debug_echo() {

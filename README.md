@@ -4,58 +4,32 @@
 [![Documentation](https://docs.rs/kcp-tokio/badge.svg)](https://docs.rs/kcp-tokio)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-
 A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol built on top of Tokio.
 
-## 🚀 Features
+## Features
 
 - **Async-First Design**: Built from ground up for async/await with Tokio integration
 - **Zero-Copy**: Efficient buffer management using the `bytes` crate
+- **Lock-Free Buffer Pool**: High-performance memory management with `crossbeam`
 - **Connection-Oriented**: High-level connection abstractions (`KcpStream`, `KcpListener`)
-- **Backward Compatible**: Protocol-level compatibility with original C implementation
+- **Protocol Compatible**: Compatible with original C KCP implementation
 - **Observability**: Integrated tracing and metrics support
 - **Memory Efficient**: Object pooling and buffer reuse
-- **Multiple Performance Modes**: Normal, Fast, Turbo, and specialized presets
-- **Flexible Configuration**: Comprehensive configuration options for different use cases
+- **Multiple Performance Modes**: Normal, Fast, Turbo, Gaming presets
 
-## 📦 Installation
+## Installation
 
 Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3.3"
+kcp-tokio = "0.3.4"
+tokio = { version = "1.0", features = ["full"] }
 ```
 
-## 🎯 Quick Start
+## Quick Start
 
-### Basic Echo Server
-
-```rust
-use kcp_tokio::{KcpConfig, async_kcp::{KcpListener, KcpStream}};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Server
-    let config = KcpConfig::realtime();
-    let mut listener = KcpListener::bind("127.0.0.1:12345", config).await?;
-    
-    while let Ok((mut stream, addr)) = listener.accept().await {
-        tokio::spawn(async move {
-            let mut buf = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut buf).await {
-                if n == 0 { break; }
-                stream.write_all(&buf[..n]).await.unwrap();
-            }
-        });
-    }
-    
-    Ok(())
-}
-```
-
-### Basic Client
+### Client
 
 ```rust
 use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
@@ -64,202 +38,200 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = KcpConfig::new().fast_mode();
-    let mut stream = KcpStream::connect("127.0.0.1:12345", config).await?;
-    
+    let mut stream = KcpStream::connect("127.0.0.1:12345".parse()?, config).await?;
+
     // Send data
     stream.write_all(b"Hello, KCP!").await?;
-    
-    // Receive echo
+
+    // Receive response
     let mut buffer = [0u8; 1024];
     let n = stream.read(&mut buffer).await?;
     println!("Received: {}", String::from_utf8_lossy(&buffer[..n]));
-    
+
     Ok(())
 }
 ```
 
-## 🏗️ Architecture
+### Server
 
-This implementation features a layered architecture designed for performance and maintainability:
+```rust
+use kcp_tokio::{KcpConfig, async_kcp::KcpListener};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = KcpConfig::realtime();
+    let mut listener = KcpListener::bind("127.0.0.1:12345".parse()?, config).await?;
+
+    println!("Server listening on 127.0.0.1:12345");
+
+    while let Ok((mut stream, addr)) = listener.accept().await {
+        println!("New connection from {}", addr);
+        tokio::spawn(async move {
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut buf).await {
+                if n == 0 { break; }
+                let _ = stream.write_all(&buf[..n]).await;
+            }
+        });
+    }
+
+    Ok(())
+}
+```
+
+## Architecture
 
 ```
-┌─────────────────────┐
-│   High-Level API    │  KcpStream, KcpListener
-├─────────────────────┤
-│   Connection Layer  │  KcpConnection, Session Management  
-├─────────────────────┤
-│   Protocol Core     │  Async KCP Engine
-├─────────────────────┤
-│   Transport Layer   │  UDP Socket, Packet I/O
-└─────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│                    Application Layer                         │
+│              (User code using KcpStream/KcpListener)         │
+├─────────────────────────────────────────────────────────────┤
+│                    High-Level API Layer                      │
+│                  KcpStream    KcpListener                    │
+│           (AsyncRead/AsyncWrite, TCP-like interface)         │
+├─────────────────────────────────────────────────────────────┤
+│                    Protocol Core Layer                       │
+│                       KcpEngine                              │
+│        (ARQ logic, congestion control, retransmission)       │
+├─────────────────────────────────────────────────────────────┤
+│                    Common Layer                              │
+│         KcpSegment, KcpHeader, BufferPool, Constants         │
+├─────────────────────────────────────────────────────────────┤
+│                    Transport Layer                           │
+│                   UDP Socket (Tokio)                         │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Key Components
-
-- **KcpStream/KcpListener**: High-level async I/O interfaces
-- **KcpConnection**: Connection state management and packet routing
-- **KcpEngine**: Core KCP protocol implementation with async support
-- **KcpConfig**: Comprehensive configuration system
-
-## ⚙️ Configuration
-
-KCP Rust provides flexible configuration options for different use cases:
+## Configuration
 
 ### Performance Presets
 
 ```rust
-// For gaming applications - ultra-low latency
+// Gaming - ultra-low latency (3ms update interval)
 let config = KcpConfig::gaming();
 
-// For file transfers - high throughput
-let config = KcpConfig::file_transfer();
-
-// For real-time communication - balanced
+// Real-time communication (8ms update interval)
 let config = KcpConfig::realtime();
 
-// For testing with packet loss simulation
+// File transfer - high throughput
+let config = KcpConfig::file_transfer();
+
+// Testing with packet loss simulation
 let config = KcpConfig::testing(0.1); // 10% packet loss
-```
-
-### Custom Configuration
-
-```rust
-let config = KcpConfig::new()
-    .fast_mode()                    // Low latency mode
-    .window_size(128, 128)         // Send/Receive windows
-    .mtu(1400)                     // Maximum transmission unit
-    .connect_timeout(Duration::from_secs(10))
-    .keep_alive(Some(Duration::from_secs(30)))
-    .stream_mode(true);            // Enable streaming mode
 ```
 
 ### Performance Modes
 
-- **Normal Mode**: Balanced performance and reliability (40ms interval)
-- **Fast Mode**: Optimized for low latency applications (10ms interval)  
-- **Turbo Mode**: Maximum performance with minimal latency (5ms interval)
+| Mode | Update Interval | Resend | Congestion Control | Use Case |
+|------|----------------|--------|-------------------|----------|
+| Normal | 40ms | 0 | Yes | General purpose |
+| Fast | 8ms | 2 | Yes | Low latency |
+| Turbo | 4ms | 1 | No | Maximum speed |
+| Gaming | 3ms | 1 | No | Real-time games |
+
+### Custom Configuration
 
 ```rust
+use std::time::Duration;
+
 let config = KcpConfig::new()
-    .turbo_mode()                  // Maximum performance (5ms updates)
-    .window_size(256, 256)         // Larger windows
-    .mtu(1200);                    // Optimized MTU
+    .fast_mode()
+    .window_size(128, 128)
+    .mtu(1400)
+    .connect_timeout(Duration::from_secs(10))
+    .keep_alive(Some(Duration::from_secs(30)))
+    .stream_mode(true);
 ```
 
-## 📖 Examples
-
-The `examples/` directory contains several complete examples:
-
-### Run Echo Server/Client
+## Examples
 
 ```bash
-# Terminal 1 - Start server
-cargo run --example simple_echo server 127.0.0.1:12345
+# Run performance test server
+cargo run --example perf_test_server -- 127.0.0.1:12345 gaming
 
-# Terminal 2 - Run client
-cargo run --example simple_echo client 127.0.0.1:12345
+# Run performance test client
+cargo run --example perf_test_client -- 127.0.0.1:12345
+
+# Run simple echo example
+cargo run --example simple_echo
 ```
 
-### Available Examples
-
-- **simple_echo**: Basic echo server and client
-- **interop_client**: Interoperability test with C KCP implementation
-- **quick_test**: Performance and reliability testing
-
-## 🧪 Testing
-
-Run the test suite:
+## Testing
 
 ```bash
 # Run all tests
 cargo test
 
-# Run integration tests
-cargo test --test integration_test
+# Run with logging
+RUST_LOG=debug cargo test -- --nocapture
 
-# Run with output
-cargo test -- --nocapture
+# Run specific test
+cargo test test_echo_debug -- --nocapture
+
+# Run clippy
+cargo clippy --all-targets
 ```
 
-### Test Features
+## Documentation
 
-- **Integration Tests**: Full protocol testing with simulated networks
-- **Performance Tests**: Throughput and latency benchmarks
-- **Interoperability Tests**: Compatibility with original C implementation
+Detailed documentation is available in the [`doc/`](doc/) directory:
 
-## 🎯 Use Cases
+| Document | Description |
+|----------|-------------|
+| [ARCHITECTURE.md](doc/ARCHITECTURE.md) | System architecture and design |
+| [MODULES.md](doc/MODULES.md) | Module reference and APIs |
+| [USAGE.md](doc/USAGE.md) | Usage guide and examples |
+| [TESTING.md](doc/TESTING.md) | Testing guide |
 
-### Gaming
-- Ultra-low latency communication
-- Reliable packet delivery for game state
-- Custom congestion control
+## Performance
 
-### Real-time Communication
-- Voice/video streaming protocols
-- Live data feeds
-- Interactive applications
+KCP provides significant latency improvements over TCP:
 
-### File Transfer
-- Reliable bulk data transfer
-- Resume capability
-- Network-adaptive throughput
+- **30-40% lower latency** in typical network conditions
+- **Better performance** on lossy networks
+- **Configurable trade-offs** between latency and bandwidth
 
-## 🔧 Advanced Features
+### Optimizations in this Implementation
 
-### Stream Mode
-```rust
-let config = KcpConfig::new().stream_mode(true);
-```
-Enables TCP-like streaming without message boundaries.
+- Lock-free buffer pools using `crossbeam::queue::ArrayQueue`
+- Zero-copy packet handling with `bytes` crate
+- Grouped state structs for better cache locality
+- Configurable update intervals (3-40ms)
+- Batch ACK processing
 
-### Packet Loss Simulation
-```rust
-let config = KcpConfig::new().simulate_packet_loss(0.05); // 5% loss
-```
-Useful for testing network resilience.
+## Use Cases
 
-### Custom Socket Buffers
-```rust
-let config = KcpConfig::new().socket_buffer_size(64 * 1024); // 64KB buffers
-```
+- **Gaming**: Ultra-low latency for real-time multiplayer
+- **VoIP/Video**: Real-time communication
+- **Live Streaming**: Low-latency data delivery
+- **File Transfer**: Reliable bulk data transfer
+- **IoT**: Efficient communication for constrained devices
 
-## 📊 Performance
+## Compatibility
 
-KCP Rust is optimized for:
-- **Low Latency**: Typically 30-40% lower than TCP
-- **High Throughput**: Efficient zero-copy operations
-- **Memory Efficiency**: Object pooling and buffer reuse
-- **CPU Efficiency**: Async/await reduces context switching
+- **Protocol**: Compatible with [original C KCP](https://github.com/skywind3000/kcp)
+- **Rust**: Edition 2021, stable toolchain
+- **Tokio**: 1.0+
 
-## 🔗 Compatibility
+## License
 
-- **Protocol**: Compatible with original C KCP implementation
-- **Rust**: Requires Rust 1.70+
-- **Tokio**: Built on Tokio 1.0+ for async runtime
+MIT License - see [LICENSE](LICENSE) file.
 
-## 📝 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
 
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
-3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
-4. Push to the branch (`git push origin feature/AmazingFeature`)
-5. Open a Pull Request
-
-## 📚 Resources
+## Resources
 
 - [Original KCP Protocol](https://github.com/skywind3000/kcp)
 - [KCP Protocol Documentation](https://github.com/skywind3000/kcp/blob/master/README.en.md)
 - [Tokio Documentation](https://tokio.rs/)
 
-## 🏷️ Version History
+## Version History
 
-- **v0.3.3**: Current version with optimized performance and reduced latency
-- **v0.3.1**: Full async support and comprehensive configuration
-- **v0.2.x**: Improved performance and bug fixes
+- **v0.3.4**: Engine refactoring, lock-free buffer pools, documentation
+- **v0.3.3**: Performance optimizations, sub-millisecond latency
+- **v0.3.1**: Full async support, comprehensive configuration
+- **v0.2.x**: Performance improvements and bug fixes
 - **v0.1.x**: Initial implementation

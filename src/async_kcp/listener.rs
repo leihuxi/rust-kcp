@@ -17,6 +17,7 @@ use tracing::{debug, error, info, trace, warn};
 /// Simple stream handle for packet routing
 struct StreamHandle {
     engine: Arc<Mutex<crate::async_kcp::engine::KcpEngine>>,
+    data_tx: tokio::sync::mpsc::Sender<Bytes>,
 }
 
 impl StreamHandle {
@@ -24,6 +25,13 @@ impl StreamHandle {
         let mut engine = self.engine.lock().await;
         engine.input(data).await?;
         engine.update().await?;
+
+        // Drain all complete messages and send via channel
+        while let Ok(Some(msg)) = engine.recv().await {
+            if self.data_tx.try_send(msg).is_err() {
+                break; // Channel full or closed
+            }
+        }
         Ok(())
     }
 }
@@ -340,9 +348,10 @@ impl KcpListener {
         )
         .await?;
 
-        // Create a handle for packet routing
+        // Create a handle for packet routing with data channel
         let handle = StreamHandle {
             engine: stream.engine.clone(),
+            data_tx: stream.data_sender(),
         };
 
         // Mark connection as active and save the handle
