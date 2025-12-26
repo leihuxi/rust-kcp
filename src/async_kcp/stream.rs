@@ -50,19 +50,18 @@ impl KcpStream {
         socket.connect(addr).await.map_err(KcpError::Io)?;
         trace!("CLIENT: Connected to remote address {}", addr);
 
-        Self::new_with_socket(socket, addr, config, true).await
+        Self::new_with_socket(Arc::new(socket), addr, config, true).await
     }
 
     /// Create a new KCP stream with a specific conversation ID (for server side)
     pub async fn new_with_conv(
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
         conv: ConvId,
         config: KcpConfig,
         _is_client: bool,
     ) -> Result<Self> {
         let engine = KcpEngine::new(conv, config.clone());
-        let socket = Arc::new(socket);
         let engine = Arc::new(Mutex::new(engine));
 
         let mut stream = Self {
@@ -191,7 +190,7 @@ impl KcpStream {
 
     /// Create a new KCP stream from an existing UDP socket
     pub async fn new_with_socket(
-        socket: UdpSocket,
+        socket: Arc<UdpSocket>,
         peer_addr: SocketAddr,
         config: KcpConfig,
         is_client: bool,
