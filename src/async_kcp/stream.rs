@@ -596,7 +596,3 @@ impl AsyncWrite for KcpStream {
         Poll::Ready(Ok(()))
     }
 }
-
-// Make KcpStream safe to send between threads
-unsafe impl Send for KcpStream {}
-unsafe impl Sync for KcpStream {}
