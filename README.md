@@ -23,7 +23,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3.5"
+kcp-tokio = "0.3.6"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -235,7 +235,7 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 ## Version History
 
-- **v0.3.5**: Actor-based lock-free architecture, DashMap packet routing, BTreeMap receive buffer, zero-copy segment encoding, timestamp caching
+- **v0.3.6**: Actor-based lock-free architecture, DashMap packet routing, BTreeMap receive buffer, zero-copy segment encoding, timestamp caching
 - **v0.3.4**: Engine refactoring, lock-free buffer pools, documentation
 - **v0.3.3**: Performance optimizations, sub-millisecond latency
 - **v0.3.1**: Full async support, comprehensive configuration
