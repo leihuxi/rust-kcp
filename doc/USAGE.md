@@ -178,36 +178,30 @@ stream.close().await?;
 
 ## Advanced Usage
 
-### Custom Output Function
+### Custom Transport
 
-For special transport requirements:
+For special transport requirements, implement the `Transport` trait:
 
 ```rust
-use kcp_tokio::async_kcp::engine::{KcpEngine, OutputFn};
-use std::sync::Arc;
-use bytes::Bytes;
+use kcp_tokio::transport::Transport;
 
-let output_fn: OutputFn = Arc::new(move |data: Bytes| {
-    let socket = socket.clone();
-    Box::pin(async move {
-        // Custom packet sending logic
-        socket.send_to(&data, target_addr).await?;
-        Ok(())
-    })
-});
+struct MyTransport { /* ... */ }
 
-engine.set_output(output_fn);
+#[async_trait::async_trait]
+impl Transport for MyTransport {
+    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> std::io::Result<usize> { /* ... */ }
+    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> { /* ... */ }
+    fn local_addr(&self) -> std::io::Result<SocketAddr> { /* ... */ }
+}
+
+// Use with listener
+let transport = Arc::new(MyTransport::new());
+let listener = KcpListener::with_transport(transport, config).await?;
 ```
 
 ### Monitoring Statistics
 
 ```rust
-// Per-connection statistics
-let stats = stream.engine.lock().await.stats();
-println!("RTT: {}ms", stats.rtt);
-println!("Packets sent: {}", stats.packets_sent);
-println!("Retransmissions: {}", stats.retransmissions);
-
 // Global metrics
 use kcp_tokio::metrics::global_metrics;
 

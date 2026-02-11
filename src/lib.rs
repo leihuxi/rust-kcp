@@ -55,14 +55,23 @@
 //! └─────────────────────┘
 //! ```
 
-// Main async implementation
+// Main async implementation (requires tokio runtime)
+#[cfg(feature = "tokio")]
 pub mod async_kcp;
-pub use async_kcp::*;
+#[cfg(feature = "tokio")]
+pub use async_kcp::{KcpListener, KcpStream};
+
+// Transport abstraction (trait is always available; UdpTransport requires tokio)
+pub mod transport;
+pub use transport::Transport;
+#[cfg(feature = "tokio")]
+pub use transport::UdpTransport;
 
 // Common types and utilities
 pub mod common;
 pub mod config;
 pub mod error;
+#[cfg(feature = "tokio")]
 pub mod metrics;
 
 // Re-exports

@@ -33,6 +33,9 @@ KCP-Rust is a high-performance async implementation of the KCP (Fast and Reliabl
 
 The protocol core implementing KCP ARQ logic:
 
+All methods are synchronous (`fn`, not `async fn`). Output packets are buffered in
+`output_queue` and drained by the actor via `drain_output()`.
+
 ```rust
 pub struct KcpEngine {
     // Core identifiers
@@ -50,44 +53,37 @@ pub struct KcpEngine {
     probe: ProbeState,    // Window probing
 
     // Buffers
-    snd_queue: VecDeque<KcpSegment>,  // User data waiting to send
-    rcv_queue: VecDeque<KcpSegment>,  // Received data for user
-    snd_buf: VecDeque<KcpSegment>,    // Sent but unacknowledged
-    rcv_buf: VecDeque<KcpSegment>,    // Received out-of-order
+    snd_queue: VecDeque<KcpSegment>,       // User data waiting to send
+    rcv_queue: VecDeque<KcpSegment>,       // Received data for user
+    snd_buf: VecDeque<KcpSegment>,         // Sent but unacknowledged
+    rcv_buf: BTreeMap<SeqNum, KcpSegment>, // Received out-of-order (O(log n) insert)
     ack_list: Vec<(SeqNum, Timestamp)>,
+
+    // Output queue (actor drains this after each engine call)
+    output_queue: Vec<Bytes>,
 }
 ```
 
 **Key Features:**
-- Nested state structs for better code organization
+- All methods synchronous — no internal locking or async
+- `BTreeMap` receive buffer for O(log n) insertion of out-of-order packets
+- Zero-copy segment encoding in flush (encodes by reference, no clone)
+- Cached timestamps to minimize syscalls per `input()` call
 - Lock-free buffer pool integration
 - Configurable congestion control
 - Fast retransmission support
 
 ### 2. KcpStream (`src/async_kcp/stream.rs`)
 
-High-level async stream providing TCP-like interface:
+High-level async stream providing TCP-like interface. Each stream spawns a dedicated
+actor task that owns the `KcpEngine` exclusively — no `Arc<Mutex<>>` needed.
 
-```rust
-pub struct KcpStream {
-    engine: Arc<Mutex<KcpEngine>>,
-    socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-
-    // Async data flow
-    data_rx: mpsc::Receiver<Bytes>,
-    data_tx: mpsc::Sender<Bytes>,
-
-    // Background tasks
-    update_task: Option<JoinHandle<()>>,
-    recv_task: Option<JoinHandle<()>>,
-}
-```
+Communication between the stream handle and actor uses mpsc channels (`EngineCmd`).
 
 **Implements:**
 - `AsyncRead` / `AsyncWrite` traits
 - Native `send()` / `recv()` methods
-- Background update and receive tasks
+- Actor-based background task (update + I/O in one loop)
 
 ### 3. KcpListener (`src/async_kcp/listener.rs`)
 
@@ -95,7 +91,8 @@ Server-side connection acceptor:
 
 - Binds to UDP socket
 - Manages multiple connections via shared socket
-- Routes packets to appropriate streams by conversation ID
+- Routes packets to appropriate streams using `DashMap` (lock-free concurrent hashmap)
+- Packet routing hot path requires no async lock acquisition
 
 ### 4. KcpConfig (`src/config.rs`)
 
@@ -197,26 +194,35 @@ Lock-free buffer pools using `crossbeam::queue::ArrayQueue`:
 
 ## Concurrency Model
 
+Actor-based lock-free architecture (v0.3.5+):
+
 ```
 ┌─────────────────────────────────────────────────┐
 │                  User Task                       │
 │         (async read/write operations)            │
+│         KcpStream handle (no engine)             │
 └─────────────────────────────────────────────────┘
-                      │
-          ┌───────────┴───────────┐
-          ▼                       ▼
-┌─────────────────┐     ┌─────────────────┐
-│   update_task   │     │    recv_task    │
-│ (periodic flush)│     │ (packet receive)│
-└─────────────────┘     └─────────────────┘
-          │                       │
-          └───────────┬───────────┘
-                      ▼
-            ┌─────────────────┐
-            │  Arc<Mutex<     │
-            │   KcpEngine>>   │
-            └─────────────────┘
+          │ EngineCmd (mpsc)        ▲ data_rx (mpsc)
+          ▼                         │
+┌─────────────────────────────────────────────────┐
+│              Actor Task (dedicated)              │
+│   ┌─────────────┐  ┌──────────┐  ┌──────────┐  │
+│   │  KcpEngine  │  │ input_rx │  │  timer   │  │
+│   │ (owned, no  │  │ (packets │  │ (update  │  │
+│   │  lock)      │  │  from    │  │  flush)  │  │
+│   │             │  │  socket) │  │          │  │
+│   └─────────────┘  └──────────┘  └──────────┘  │
+│         │                                        │
+│         ▼ drain_output()                         │
+│   ┌─────────────┐                                │
+│   │ Transport   │ send_to() over UDP             │
+│   └─────────────┘                                │
+└─────────────────────────────────────────────────┘
 ```
+
+The KcpEngine lives in a single dedicated tokio task (actor). All engine methods
+are synchronous. The actor handles input packets, user commands, and periodic
+updates in a single `tokio::select!` loop — no mutex contention.
 
 ## Protocol Constants
 
@@ -245,8 +251,13 @@ pub enum KcpError {
 
 ## Performance Optimizations
 
-1. **Lock-free Buffer Pool** - Crossbeam ArrayQueue
-2. **Batch ACK Processing** - Pre-allocated vectors
-3. **Inline Helper Methods** - `mss()`, `reset_cwnd()`
-4. **Grouped State Structs** - Better cache locality
-5. **Configurable Update Intervals** - 3-40ms based on mode
+1. **Actor-based lock-free architecture** - KcpEngine owned by single task, no `Arc<Mutex<>>`
+2. **DashMap packet routing** - Listener uses lock-free concurrent hashmap on every incoming packet
+3. **BTreeMap receive buffer** - O(log n) insert for out-of-order packets (was O(n) VecDeque scan + shift)
+4. **Zero-copy segment flush** - `flush_data_segments()` encodes by reference, no `segment.clone()`
+5. **Cached timestamps** - Single `current_timestamp()` syscall per `input()` (was 3+)
+6. **Lock-free Buffer Pool** - Crossbeam ArrayQueue for zero-allocation fast path
+7. **Batch ACK Processing** - Pre-allocated vectors
+8. **Inline Helper Methods** - `mss()`, `reset_cwnd()`
+9. **Grouped State Structs** - Better cache locality
+10. **Configurable Update Intervals** - 3-40ms based on mode

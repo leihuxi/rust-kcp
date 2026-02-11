@@ -12,6 +12,8 @@ kcp-tokio/
 │   ├── metrics.rs          # Performance monitoring
 │   └── async_kcp/
 │       ├── mod.rs          # Module exports
+│       ├── mod.rs          # Module exports
+│       ├── actor.rs        # Actor task (owns KcpEngine)
 │       ├── engine.rs       # KCP protocol core
 │       ├── stream.rs       # High-level stream API
 │       └── listener.rs     # Server listener
@@ -242,7 +244,7 @@ pub struct KcpStats {
 
 ### Buffer Pool
 
-Lock-free buffer management:
+Lock-free buffer management using `crossbeam::queue::ArrayQueue`:
 
 ```rust
 pub struct BufferPool {
@@ -251,7 +253,13 @@ pub struct BufferPool {
     hits: AtomicUsize,
 }
 
-// Global pool functions
+impl BufferPool {
+    pub fn try_get(&self) -> BytesMut;     // Get buffer (lock-free)
+    pub fn try_put(&self, buf: BytesMut);  // Return buffer (lock-free)
+    pub fn stats(&self) -> (usize, usize); // (hits, current_size)
+}
+
+// Global pool functions (select pool by size)
 pub fn try_get_buffer(size_hint: usize) -> BytesMut;
 pub fn try_put_buffer(buf: BytesMut);
 pub fn buffer_pool_stats() -> Vec<(&'static str, usize, usize)>;
@@ -302,6 +310,9 @@ struct ProbeState {
 
 Core protocol engine:
 
+All methods are synchronous. Output packets are buffered in `output_queue`
+and drained by the actor via `drain_output()`.
+
 ```rust
 pub struct KcpEngine {
     conv: ConvId,
@@ -315,10 +326,10 @@ pub struct KcpEngine {
     snd_queue: VecDeque<KcpSegment>,
     rcv_queue: VecDeque<KcpSegment>,
     snd_buf: VecDeque<KcpSegment>,
-    rcv_buf: VecDeque<KcpSegment>,
+    rcv_buf: BTreeMap<SeqNum, KcpSegment>,  // O(log n) insert
     ack_list: Vec<(SeqNum, Timestamp)>,
+    output_queue: Vec<Bytes>,               // Buffered output packets
     stats: KcpStats,
-    output: Option<OutputFn>,
     // ...
 }
 ```
@@ -328,15 +339,17 @@ pub struct KcpEngine {
 | Method | Description |
 |--------|-------------|
 | `new(conv, config)` | Create new engine |
-| `set_output(fn)` | Set packet output function |
 | `start()` | Start the engine |
 | `send(data)` | Queue data for sending |
 | `recv()` | Receive assembled data |
 | `input(data)` | Process incoming packet |
 | `flush()` | Flush pending data |
 | `update()` | Periodic state update |
+| `drain_output()` | Drain buffered output packets |
 | `stats()` | Get current statistics |
 | `is_dead()` | Check connection health |
+| `idle_ms()` | Milliseconds since last activity |
+| `keep_alive_probe()` | Trigger window probe |
 
 ---
 
@@ -346,17 +359,21 @@ pub struct KcpEngine {
 
 ### `KcpStream`
 
-TCP-like stream over KCP:
+TCP-like stream over KCP. Uses actor-based architecture — the stream handle
+communicates with a dedicated actor task via channels (no `Arc<Mutex<>>`).
 
 ```rust
 pub struct KcpStream {
-    engine: Arc<Mutex<KcpEngine>>,
-    socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     config: KcpConfig,
+
+    // Communication with actor
+    cmd_tx: mpsc::Sender<EngineCmd>,   // Send commands to actor
+    data_rx: mpsc::Receiver<Bytes>,    // Receive data from actor
+    input_tx: mpsc::Sender<Bytes>,     // Route packets to actor
+
+    // Read buffering
     read_buf: BytesMut,
-    data_rx: mpsc::Receiver<Bytes>,
-    data_tx: mpsc::Sender<Bytes>,
     // ...
 }
 ```
@@ -385,13 +402,16 @@ pub struct KcpStream {
 
 ### `KcpListener`
 
-Server-side listener:
+Server-side listener. Uses `DashMap` for lock-free packet routing on the hot path.
 
 ```rust
 pub struct KcpListener {
-    socket: Arc<UdpSocket>,
+    transport: Arc<dyn Transport>,
     config: KcpConfig,
-    pending_connections: mpsc::Receiver<(KcpStream, SocketAddr)>,
+    local_addr: SocketAddr,
+    conn_state: Arc<RwLock<ConnectionState>>,
+    active_streams: Arc<DashMap<SocketAddr, StreamHandle>>,  // Lock-free routing
+    connection_queue: mpsc::UnboundedReceiver<IncomingConnection>,
     // ...
 }
 ```

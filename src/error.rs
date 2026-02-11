@@ -149,6 +149,16 @@ impl KcpError {
         matches!(self, KcpError::Connection { .. })
     }
 
+    /// Check if this is a fatal error that should stop background tasks
+    pub fn is_fatal(&self) -> bool {
+        matches!(
+            self,
+            KcpError::Connection {
+                kind: ConnectionError::Lost | ConnectionError::Closed | ConnectionError::Reset
+            } | KcpError::Internal { .. }
+        )
+    }
+
     /// Check if this error indicates the connection is closed
     pub fn is_closed(&self) -> bool {
         match self {

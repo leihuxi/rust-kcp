@@ -83,29 +83,10 @@ fn test_connection_monitor() {
 
 | Test File | Description |
 |-----------|-------------|
-| `echo_test.rs` | Basic echo functionality |
-| `integration_test.rs` | Comprehensive integration |
-| `simple_echo_debug.rs` | Simple echo with debug |
-| `debug_multiple_messages.rs` | Multi-message exchange |
-| `test_echo_debug.rs` | Echo with native API |
-
-### Debug Tests
-
-Special tests for protocol debugging:
-
-```bash
-# Basic echo
-cargo test debug_echo_simple -- --nocapture
-
-# Multiple messages
-cargo test debug_multiple_messages -- --nocapture
-
-# Handshake debugging
-cargo test debug_handshake_detailed -- --nocapture
-
-# Client receive debugging
-cargo test debug_client_recv -- --nocapture
-```
+| `echo_test.rs` | Basic echo and multi-message functionality |
+| `integration_test.rs` | Comprehensive integration (send/recv, bidirectional, fragmentation) |
+| `simple_test.rs` | Simple configuration and message tests |
+| `simple_kcp_test.rs` | Minimal KCP echo test |
 
 ## Test Structure
 

@@ -13,12 +13,11 @@ homepage = "https://github.com/leihuxi/rust-kcp"
 
 [features]
 default = ["tokio"]
-tokio = ["dep:tokio", "dep:tokio-util"]
+tokio = ["dep:tokio"]
 
 [dependencies]
 # Core async runtime
-tokio = { version = "1.0", features = ["full"], optional = true }
-tokio-util = { version = "0.7", optional = true }
+tokio = { version = "1.0", features = ["net", "rt-multi-thread", "sync", "time", "macros", "io-util", "signal"], optional = true }
 
 # Serialization and networking
 bytes = "1.0"
@@ -27,14 +26,9 @@ thiserror = "1.0"
 # Logging
 tracing = "0.1"
 
-# Random number generation
-rand = "0.8"
-
 # Lock-free data structures
-crossbeam = "0.8"
-
-# Lazy static for global state
-lazy_static = "1.4"
+crossbeam-queue = "0.3"
+dashmap = "6.1"
 
 [dev-dependencies]
 tokio-test = "0.4"

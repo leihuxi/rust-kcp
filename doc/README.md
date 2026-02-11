@@ -58,6 +58,6 @@ kcp-rust/
 
 ## Version
 
-- Library Version: 0.3.4
+- Library Version: 0.3.5
 - Protocol Version: 1
 - Rust Edition: 2021

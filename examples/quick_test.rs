@@ -1,12 +1,11 @@
 //! Quick test for Rust KCP communication with C server
 
 use bytes::Bytes;
-use kcp_tokio::async_kcp::engine::{KcpEngine, OutputFn};
+use kcp_tokio::async_kcp::engine::KcpEngine;
 use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
-use tokio::sync::Mutex;
 use tracing::{error, info};
 
 #[tokio::main]
@@ -24,68 +23,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let conv = 0x12345678u32;
     let config = KcpConfig::new().fast_mode();
     let mut engine = KcpEngine::new(conv, config);
-
-    // Set output function
-    let socket_clone = socket.clone();
-    let output_fn: OutputFn = Arc::new(move |data: Bytes| {
-        let socket = socket_clone.clone();
-        Box::pin(async move {
-            socket
-                .send(&data)
-                .await
-                .map_err(kcp_tokio::error::KcpError::Io)?;
-            info!("Sent {} bytes to C server", data.len());
-            Ok(())
-        })
-    });
-
-    engine.set_output(output_fn);
-    engine.start().await?;
-    let engine = Arc::new(Mutex::new(engine));
+    engine.start()?;
 
     info!("Quick test started, sending one message...");
 
     // Send a test message
-    {
-        let mut engine = engine.lock().await;
-        engine.send(Bytes::from("Quick test!")).await?;
-        info!("Message sent to KCP engine");
+    engine.send(Bytes::from("Quick test!"))?;
+    info!("Message sent to KCP engine");
+
+    // Flush output to the network
+    for buf in engine.drain_output() {
+        socket.send(&buf).await?;
     }
 
     // Simple receive loop
-    tokio::spawn({
-        let engine = engine.clone();
-        let socket = socket.clone();
-        async move {
-            let mut buf = vec![0u8; 2048];
-            for _ in 0..10 {
-                if let Ok(size) = socket.recv(&mut buf).await {
-                    info!("Received UDP packet: {} bytes", size);
-                    let data = Bytes::copy_from_slice(&buf[..size]);
-                    let mut engine = engine.lock().await;
-                    if let Err(e) = engine.input(data).await {
-                        error!("KCP input error: {}", e);
-                    }
+    let mut recv_buf = vec![0u8; 2048];
+    for _ in 0..50 {
+        // Try to receive a UDP packet with a short timeout
+        if let Ok(Ok(size)) = tokio::time::timeout(
+            tokio::time::Duration::from_millis(100),
+            socket.recv(&mut recv_buf),
+        )
+        .await
+        {
+            info!("Received UDP packet: {} bytes", size);
+            let data = Bytes::copy_from_slice(&recv_buf[..size]);
+            if let Err(e) = engine.input(data) {
+                error!("KCP input error: {}", e);
+            }
 
-                    // Try to receive KCP data
-                    if let Ok(Some(kcp_data)) = engine.recv().await {
-                        let response = String::from_utf8_lossy(&kcp_data);
-                        info!("✓ Got KCP response: {}", response);
-                        return;
-                    }
-                }
-                tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+            // Try to receive KCP data
+            if let Ok(Some(kcp_data)) = engine.recv() {
+                let response = String::from_utf8_lossy(&kcp_data);
+                info!("✓ Got KCP response: {}", response);
+                break;
             }
         }
-    });
 
-    // Update loop
-    for _ in 0..50 {
-        {
-            let mut engine = engine.lock().await;
-            engine.update().await?;
+        // Periodic update
+        let _ = engine.update();
+        for buf in engine.drain_output() {
+            let _ = socket.send(&buf).await;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     }
 
     info!("Quick test completed");

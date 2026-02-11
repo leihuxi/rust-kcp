@@ -273,10 +273,9 @@ pub struct RttStats {
     pub sample_count: usize,
 }
 
-lazy_static::lazy_static! {
-    /// Global metrics instance
-    pub static ref GLOBAL_METRICS: GlobalMetrics = GlobalMetrics::default();
-}
+/// Global metrics instance
+pub static GLOBAL_METRICS: std::sync::LazyLock<GlobalMetrics> =
+    std::sync::LazyLock::new(GlobalMetrics::default);
 
 /// Get global metrics
 pub fn global_metrics() -> &'static GlobalMetrics {

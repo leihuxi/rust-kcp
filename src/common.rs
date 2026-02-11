@@ -1,6 +1,7 @@
 //! Common types and utilities for KCP implementation
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// KCP protocol constants
@@ -271,9 +272,9 @@ pub fn seq_after(seq1: SeqNum, seq2: SeqNum) -> bool {
     (seq1.wrapping_sub(seq2) as i32) > 0
 }
 
-/// High-performance lock-free buffer pool using crossbeam
+/// High-performance lock-free buffer pool using crossbeam-queue
 pub struct BufferPool {
-    pool: crossbeam::queue::ArrayQueue<BytesMut>,
+    pool: crossbeam_queue::ArrayQueue<BytesMut>,
     buffer_size: usize,
     hits: std::sync::atomic::AtomicUsize,
 }
@@ -282,15 +283,10 @@ impl BufferPool {
     /// Create a new buffer pool
     pub fn new(max_size: usize, buffer_size: usize) -> Self {
         Self {
-            pool: crossbeam::queue::ArrayQueue::new(max_size),
+            pool: crossbeam_queue::ArrayQueue::new(max_size),
             buffer_size,
             hits: std::sync::atomic::AtomicUsize::new(0),
         }
-    }
-
-    /// Get a buffer from the pool (async-friendly, but lock-free so no await needed)
-    pub async fn get(&self) -> BytesMut {
-        self.try_get()
     }
 
     /// Get a buffer from the pool (lock-free)
@@ -302,11 +298,6 @@ impl BufferPool {
             }
             None => BytesMut::with_capacity(self.buffer_size),
         }
-    }
-
-    /// Return a buffer to the pool (async-friendly, but lock-free so no await needed)
-    pub async fn put(&self, buf: BytesMut) {
-        self.try_put(buf);
     }
 
     /// Return a buffer to the pool (lock-free)
@@ -327,26 +318,10 @@ impl BufferPool {
     }
 }
 
-lazy_static::lazy_static! {
-    // Optimized buffer pools with increased capacity and better size distribution
-    static ref SMALL_BUFFER_POOL: BufferPool = BufferPool::new(4000, 1024);   // 2x capacity for high-frequency small packets
-    static ref MEDIUM_BUFFER_POOL: BufferPool = BufferPool::new(2000, 1400);  // MTU-aligned for efficiency
-    static ref LARGE_BUFFER_POOL: BufferPool = BufferPool::new(1000, 8192);   // 2x capacity for bulk transfers
-    static ref JUMBO_BUFFER_POOL: BufferPool = BufferPool::new(200, 65536);   // New: for large fragmented messages
-}
-
-/// Get a buffer from the appropriate global pool based on size
-pub async fn get_buffer(size_hint: usize) -> BytesMut {
-    if size_hint <= 1024 {
-        SMALL_BUFFER_POOL.get().await
-    } else if size_hint <= 1400 {
-        MEDIUM_BUFFER_POOL.get().await
-    } else if size_hint <= 8192 {
-        LARGE_BUFFER_POOL.get().await
-    } else {
-        JUMBO_BUFFER_POOL.get().await
-    }
-}
+static SMALL_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(4000, 1024));
+static MEDIUM_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(2000, 1400));
+static LARGE_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(1000, 8192));
+static JUMBO_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(200, 65536));
 
 /// Get a buffer from the global pool (non-blocking)
 pub fn try_get_buffer(size_hint: usize) -> BytesMut {
@@ -358,20 +333,6 @@ pub fn try_get_buffer(size_hint: usize) -> BytesMut {
         LARGE_BUFFER_POOL.try_get()
     } else {
         JUMBO_BUFFER_POOL.try_get()
-    }
-}
-
-/// Return a buffer to the appropriate global pool
-pub async fn put_buffer(buf: BytesMut) {
-    let capacity = buf.capacity();
-    if capacity <= 1536 {
-        SMALL_BUFFER_POOL.put(buf).await;
-    } else if capacity <= 2100 {
-        MEDIUM_BUFFER_POOL.put(buf).await;
-    } else if capacity <= 12288 {
-        LARGE_BUFFER_POOL.put(buf).await;
-    } else {
-        JUMBO_BUFFER_POOL.put(buf).await;
     }
 }
 
