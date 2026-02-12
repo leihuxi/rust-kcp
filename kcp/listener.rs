@@ -1,6 +1,6 @@
 //! KCP listener for accepting incoming connections
 
-use crate::async_kcp::stream::KcpStream;
+use crate::stream::KcpStream;
 use crate::common::*;
 use crate::config::KcpConfig;
 use crate::error::{ConnectionError, KcpError, Result};
@@ -57,8 +57,8 @@ pub struct KcpListener<T: Transport = UdpTransport> {
     // Active streams for packet routing (lock-free concurrent map, accessed on every packet)
     active_streams: Arc<DashMap<T::Addr, StreamHandle>>,
 
-    connection_queue: mpsc::UnboundedReceiver<IncomingConnection<T::Addr>>,
-    connection_sender: mpsc::UnboundedSender<IncomingConnection<T::Addr>>,
+    connection_queue: mpsc::Receiver<IncomingConnection<T::Addr>>,
+    connection_sender: mpsc::Sender<IncomingConnection<T::Addr>>,
 
     // Background task
     listen_task: Option<tokio::task::JoinHandle<()>>,
@@ -83,7 +83,7 @@ impl<T: Transport> KcpListener<T> {
     pub async fn with_transport(transport: Arc<T>, config: KcpConfig) -> Result<Self> {
         let local_addr = transport.local_addr().map_err(KcpError::Io)?;
 
-        let (connection_sender, connection_queue) = mpsc::unbounded_channel();
+        let (connection_sender, connection_queue) = mpsc::channel(config.max_pending_connections);
 
         let mut listener = Self {
             transport,
@@ -174,11 +174,13 @@ impl<T: Transport> KcpListener<T> {
         let active_streams = self.active_streams.clone();
         let connection_sender = self.connection_sender.clone();
         let handshake_timeout = self.config.connect_timeout;
+        let max_pending = self.config.max_pending_connections;
+        let cleanup_dur = self.config.cleanup_interval;
 
         self.listen_task = Some(tokio::spawn(async move {
             info!("Listener background task started, waiting for packets...");
             let mut buf = vec![0u8; 65536];
-            let mut cleanup_interval = tokio::time::interval(Duration::from_secs(30));
+            let mut cleanup_interval = tokio::time::interval(cleanup_dur);
 
             loop {
                 tokio::select! {
@@ -201,6 +203,7 @@ impl<T: Transport> KcpListener<T> {
                                     &peer_addr,
                                     &conn_state,
                                     &connection_sender,
+                                    max_pending,
                                 ).await {
                                     trace!(
                                         peer = %peer_addr,
@@ -233,7 +236,8 @@ impl<T: Transport> KcpListener<T> {
         data: Bytes,
         peer_addr: &T::Addr,
         conn_state: &Arc<RwLock<ConnectionState<T::Addr>>>,
-        connection_sender: &mpsc::UnboundedSender<IncomingConnection<T::Addr>>,
+        connection_sender: &mpsc::Sender<IncomingConnection<T::Addr>>,
+        max_pending: usize,
     ) -> Result<()> {
         if data.len() >= KcpHeader::SIZE {
             let mut data_clone = data.clone();
@@ -252,6 +256,16 @@ impl<T: Transport> KcpListener<T> {
 
                 if state.pending.contains_key(peer_addr) {
                     trace!(peer = %peer_addr, "Connection already pending");
+                    return Ok(());
+                }
+
+                if state.pending.len() >= max_pending {
+                    warn!(
+                        peer = %peer_addr,
+                        pending = state.pending.len(),
+                        max = max_pending,
+                        "Rejecting new connection: pending limit reached"
+                    );
                     return Ok(());
                 }
 
@@ -274,7 +288,7 @@ impl<T: Transport> KcpListener<T> {
                 state.pending.insert(peer_addr.clone(), incoming.clone());
                 drop(state);
 
-                if connection_sender.send(incoming).is_err() {
+                if connection_sender.try_send(incoming).is_err() {
                     warn!("Connection queue is full or closed");
                     let mut state = conn_state.write().await;
                     state.pending.remove(peer_addr);

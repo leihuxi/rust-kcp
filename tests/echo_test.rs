@@ -1,6 +1,6 @@
 //! Integration test for KCP echo server/client
 
-use kcp_tokio::async_kcp::{KcpListener, KcpStream};
+use kcp_tokio::{KcpListener, KcpStream};
 use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use std::time::Duration;

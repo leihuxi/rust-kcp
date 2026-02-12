@@ -2,7 +2,7 @@
 
 use bytes::Bytes;
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use kcp_tokio::async_kcp::engine::KcpEngine;
+use kcp_tokio::engine::KcpEngine;
 use kcp_tokio::config::KcpConfig;
 
 /// Perfect transfer: all packets from src delivered to dst.

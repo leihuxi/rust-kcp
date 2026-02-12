@@ -6,7 +6,7 @@
 //! - Concurrent connection testing
 //! - Real-time performance monitoring
 
-use kcp_tokio::{async_kcp::KcpStream, metrics, KcpConfig};
+use kcp_tokio::{metrics, KcpConfig, KcpStream};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::{

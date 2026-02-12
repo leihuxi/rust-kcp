@@ -1,6 +1,10 @@
+[workspace]
+members = ["kcp-core"]
+resolver = "2"
+
 [package]
 name = "kcp-tokio"
-version = "0.3.7"
+version = "0.4.0"
 edition = "2021"
 authors = ["Leihu.Xi leihuxi@gmail.com"]
 description = "A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol"
@@ -16,6 +20,9 @@ default = ["tokio"]
 tokio = ["dep:tokio"]
 
 [dependencies]
+# Core protocol engine
+kcp-core = { path = "kcp-core" }
+
 # Core async runtime
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "sync", "time", "macros", "io-util", "signal"], optional = true }
 
@@ -42,16 +49,8 @@ name = "simple_echo"
 path = "examples/simple_echo.rs"
 
 [[example]]
-name = "interop_client"
-path = "examples/interop_client.rs"
-
-[[example]]
 name = "interop_client_simple"
 path = "examples/interop_client_simple.rs"
-
-[[example]]
-name = "quick_test"
-path = "examples/quick_test.rs"
 
 [[example]]
 name = "perf_test_server"
@@ -66,6 +65,9 @@ path = "examples/perf_test_client.rs"
 [[bench]]
 name = "kcp_bench"
 harness = false
+
+[lib]
+path = "kcp/lib.rs"
 
 [profile.release]
 opt-level = 3

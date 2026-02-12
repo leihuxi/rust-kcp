@@ -17,8 +17,8 @@ pub trait Addr: Clone + Eq + Hash + Send + Sync + Debug + Display + 'static {}
 
 impl<T: Clone + Eq + Hash + Send + Sync + Debug + Display + 'static> Addr for T {}
 
-/// Async datagram transport used by [`KcpStream`](crate::async_kcp::KcpStream)
-/// and [`KcpListener`](crate::async_kcp::KcpListener).
+/// Async datagram transport used by [`KcpStream`](crate::stream::KcpStream)
+/// and [`KcpListener`](crate::listener::KcpListener).
 ///
 /// Implementors provide send/receive operations addressed by an associated
 /// [`Addr`] type. The built-in [`UdpTransport`] uses `SocketAddr`.

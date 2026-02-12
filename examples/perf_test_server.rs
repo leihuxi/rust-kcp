@@ -6,7 +6,7 @@
 //! - Concurrent connection handling
 //! - Comprehensive metrics reporting
 
-use kcp_tokio::{async_kcp::KcpListener, metrics, KcpConfig};
+use kcp_tokio::{metrics, KcpConfig, KcpListener};
 use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -58,7 +58,7 @@ impl ServerStats {
 }
 
 async fn handle_client(
-    mut stream: kcp_tokio::async_kcp::KcpStream,
+    mut stream: kcp_tokio::KcpStream,
     client_id: u32,
     stats_tx: mpsc::UnboundedSender<(u64, u64)>,
 ) {
@@ -142,7 +142,7 @@ async fn stats_monitor(mut stats_rx: mpsc::UnboundedReceiver<(u64, u64)>) {
             _ = interval.tick() => {
                 // Print periodic stats
                 let global_metrics = metrics::global_metrics().snapshot();
-                let buffer_stats = kcp_tokio::common::buffer_pool_stats();
+                let buffer_stats = kcp_tokio::buffer_pool::buffer_pool_stats();
 
                 info!("=== Server Performance Stats ===");
                 info!("Active connections: {}", global_metrics.active_connections);

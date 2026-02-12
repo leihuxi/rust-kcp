@@ -1,7 +1,6 @@
-//! Common types and utilities for KCP implementation
+//! KCP protocol types, constants, and utilities
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::sync::LazyLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// KCP protocol constants
@@ -169,18 +168,6 @@ impl KcpSegment {
         seg
     }
 
-    /// Create batched ACK segment (for performance optimization)
-    /// Note: This is a simplified batching - in practice, would need protocol extension
-    pub fn ack_batch(conv: ConvId, acks: Vec<(SeqNum, Timestamp)>) -> Self {
-        // For now, just use the first ACK as primary (protocol compatibility)
-        // In a real implementation, this would require protocol extensions
-        if let Some((sn, ts)) = acks.first() {
-            Self::ack(conv, *sn, *ts)
-        } else {
-            Self::ack(conv, 0, 0)
-        }
-    }
-
     /// Encode segment into buffer
     pub fn encode(&self, buf: &mut BytesMut) {
         self.header.encode(buf);
@@ -230,7 +217,7 @@ impl KcpSegment {
 }
 
 /// Statistics for KCP connection
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct KcpStats {
     /// Total bytes sent
     pub bytes_sent: u64,
@@ -283,108 +270,4 @@ pub fn seq_before(seq1: SeqNum, seq2: SeqNum) -> bool {
 /// Check if a sequence number is after another (handling wrapping)
 pub fn seq_after(seq1: SeqNum, seq2: SeqNum) -> bool {
     (seq1.wrapping_sub(seq2) as i32) > 0
-}
-
-/// High-performance lock-free buffer pool using crossbeam-queue
-pub struct BufferPool {
-    pool: crossbeam_queue::ArrayQueue<BytesMut>,
-    buffer_size: usize,
-    hits: std::sync::atomic::AtomicUsize,
-}
-
-impl BufferPool {
-    /// Create a new buffer pool
-    pub fn new(max_size: usize, buffer_size: usize) -> Self {
-        Self {
-            pool: crossbeam_queue::ArrayQueue::new(max_size),
-            buffer_size,
-            hits: std::sync::atomic::AtomicUsize::new(0),
-        }
-    }
-
-    /// Get a buffer from the pool (lock-free)
-    pub fn try_get(&self) -> BytesMut {
-        match self.pool.pop() {
-            Some(buf) => {
-                self.hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                buf
-            }
-            None => BytesMut::with_capacity(self.buffer_size),
-        }
-    }
-
-    /// Return a buffer to the pool (lock-free)
-    pub fn try_put(&self, mut buf: BytesMut) {
-        // Only return buffers of appropriate size
-        if buf.capacity() >= self.buffer_size / 2 && buf.capacity() <= self.buffer_size * 2 {
-            buf.clear();
-            let _ = self.pool.push(buf); // Ignore if full
-        }
-    }
-
-    /// Get pool statistics (hits, current_size)
-    pub fn stats(&self) -> (usize, usize) {
-        (
-            self.hits.load(std::sync::atomic::Ordering::Relaxed),
-            self.pool.len(),
-        )
-    }
-}
-
-static SMALL_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(4000, 1024));
-static MEDIUM_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(2000, 1400));
-static LARGE_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(1000, 8192));
-static JUMBO_BUFFER_POOL: LazyLock<BufferPool> = LazyLock::new(|| BufferPool::new(200, 65536));
-
-/// Get a buffer from the global pool (non-blocking)
-pub fn try_get_buffer(size_hint: usize) -> BytesMut {
-    if size_hint <= 1024 {
-        SMALL_BUFFER_POOL.try_get()
-    } else if size_hint <= 1400 {
-        MEDIUM_BUFFER_POOL.try_get()
-    } else if size_hint <= 8192 {
-        LARGE_BUFFER_POOL.try_get()
-    } else {
-        JUMBO_BUFFER_POOL.try_get()
-    }
-}
-
-/// Return a buffer to the global pool (non-blocking)
-pub fn try_put_buffer(buf: BytesMut) {
-    let capacity = buf.capacity();
-    if capacity <= 1536 {
-        SMALL_BUFFER_POOL.try_put(buf);
-    } else if capacity <= 2100 {
-        MEDIUM_BUFFER_POOL.try_put(buf);
-    } else if capacity <= 12288 {
-        LARGE_BUFFER_POOL.try_put(buf);
-    } else {
-        JUMBO_BUFFER_POOL.try_put(buf);
-    }
-}
-
-/// Get buffer pool statistics for monitoring
-pub fn buffer_pool_stats() -> Vec<(&'static str, usize, usize)> {
-    vec![
-        (
-            "small",
-            SMALL_BUFFER_POOL.stats().0,
-            SMALL_BUFFER_POOL.stats().1,
-        ),
-        (
-            "medium",
-            MEDIUM_BUFFER_POOL.stats().0,
-            MEDIUM_BUFFER_POOL.stats().1,
-        ),
-        (
-            "large",
-            LARGE_BUFFER_POOL.stats().0,
-            LARGE_BUFFER_POOL.stats().1,
-        ),
-        (
-            "jumbo",
-            JUMBO_BUFFER_POOL.stats().0,
-            JUMBO_BUFFER_POOL.stats().1,
-        ),
-    ]
 }

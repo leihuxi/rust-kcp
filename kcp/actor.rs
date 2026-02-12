@@ -1,9 +1,9 @@
 //! Actor-based engine driver — owns the KcpEngine in a dedicated task,
 //! communicates via channels. Zero locks on the hot path.
 
-use crate::async_kcp::engine::KcpEngine;
+use crate::engine::KcpEngine;
 use crate::common::KcpStats;
-use crate::error::Result;
+use crate::error::{KcpError, Result};
 use crate::transport::Transport;
 
 use bytes::Bytes;
@@ -41,70 +41,42 @@ impl EngineHandle {
         Self { cmd_tx }
     }
 
-    pub async fn send(&self, data: Bytes) -> Result<()> {
+    /// Send a command and wait for the reply. Returns a connection-closed error
+    /// if the actor has exited.
+    async fn request<T>(
+        &self,
+        cmd: impl FnOnce(oneshot::Sender<T>) -> EngineCmd,
+    ) -> Result<T> {
         let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(EngineCmd::Send { data, reply })
+        self.cmd_tx
+            .send(cmd(reply))
             .await
-            .is_err()
-        {
-            return Err(crate::error::KcpError::connection(
-                crate::error::ConnectionError::Closed,
-            ));
-        }
-        rx.await.unwrap_or_else(|_| {
-            Err(crate::error::KcpError::connection(
-                crate::error::ConnectionError::Closed,
-            ))
-        })
-    }
-
-    pub async fn flush(&self) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        if self.cmd_tx.send(EngineCmd::Flush { reply }).await.is_err() {
-            return Err(crate::error::KcpError::connection(
-                crate::error::ConnectionError::Closed,
-            ));
-        }
-        rx.await.unwrap_or_else(|_| {
-            Err(crate::error::KcpError::connection(
-                crate::error::ConnectionError::Closed,
-            ))
-        })
-    }
-
-    pub async fn stats(&self) -> Result<KcpStats> {
-        let (reply, rx) = oneshot::channel();
-        if self.cmd_tx.send(EngineCmd::Stats { reply }).await.is_err() {
-            return Err(crate::error::KcpError::connection(
-                crate::error::ConnectionError::Closed,
-            ));
-        }
+            .map_err(|_| crate::error::KcpError::connection(crate::error::ConnectionError::Closed))?;
         rx.await
             .map_err(|_| crate::error::KcpError::connection(crate::error::ConnectionError::Closed))
     }
 
+    pub async fn send(&self, data: Bytes) -> Result<()> {
+        self.request(|reply| EngineCmd::Send { data, reply })
+            .await?
+    }
+
+    pub async fn flush(&self) -> Result<()> {
+        self.request(|reply| EngineCmd::Flush { reply }).await?
+    }
+
+    pub async fn stats(&self) -> Result<KcpStats> {
+        self.request(|reply| EngineCmd::Stats { reply }).await
+    }
+
     pub async fn is_alive(&self) -> bool {
-        let (reply, rx) = oneshot::channel();
-        if self
-            .cmd_tx
-            .send(EngineCmd::IsAlive { reply })
+        self.request(|reply| EngineCmd::IsAlive { reply })
             .await
-            .is_err()
-        {
-            return false;
-        }
-        rx.await.unwrap_or(false)
+            .unwrap_or(false)
     }
 
     pub fn close(&self) {
         let _ = self.cmd_tx.try_send(EngineCmd::Close);
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.cmd_tx.is_closed()
     }
 }
 
@@ -134,7 +106,9 @@ pub(crate) async fn run_engine_actor<T: Transport>(
 
     loop {
         tokio::select! {
-            // Periodic update tick
+            biased;
+
+            // Periodic update tick (prioritized to avoid timer starvation)
             _ = interval.tick() => {
                 if let Err(e) = engine.update() {
                     if e.is_fatal() {
@@ -164,17 +138,17 @@ pub(crate) async fn run_engine_actor<T: Transport>(
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(EngineCmd::Send { data, reply }) => {
-                        let r = engine.send(data);
+                        let r = engine.send(data).map_err(KcpError::from);
                         flush_output(&mut engine, &transport, &peer_addr).await;
                         let _ = reply.send(r);
                     }
                     Some(EngineCmd::Flush { reply }) => {
-                        let r = engine.flush();
+                        let r = engine.flush().map_err(KcpError::from);
                         flush_output(&mut engine, &transport, &peer_addr).await;
                         let _ = reply.send(r);
                     }
                     Some(EngineCmd::Stats { reply }) => {
-                        let _ = reply.send(engine.stats().clone());
+                        let _ = reply.send(*engine.stats());
                     }
                     Some(EngineCmd::IsAlive { reply }) => {
                         let _ = reply.send(!engine.is_dead());

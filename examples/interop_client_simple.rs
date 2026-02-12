@@ -2,7 +2,7 @@
 //! No handshake mechanism, direct communication through KCP protocol
 
 use bytes::Bytes;
-use kcp_tokio::async_kcp::engine::KcpEngine;
+use kcp_tokio::engine::KcpEngine;
 use kcp_tokio::config::KcpConfig;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -167,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Get statistics
     let stats = {
         let engine = engine.lock().await;
-        engine.stats().clone()
+        *engine.stats()
     };
 
     info!("=== Connection Statistics ===");

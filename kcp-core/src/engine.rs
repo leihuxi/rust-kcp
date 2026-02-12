@@ -1,12 +1,25 @@
-//! Async KCP protocol engine core
+//! KCP protocol engine core — pure synchronous, no runtime dependencies
 
-use crate::common::*;
-use crate::config::KcpConfig;
-use crate::error::{ConnectionError, KcpError, Result};
+use crate::config::KcpCoreConfig;
+use crate::error::{KcpCoreError, KcpCoreResult};
+use crate::protocol::*;
 
 use bytes::{Bytes, BytesMut};
 use std::collections::{BTreeMap, VecDeque};
+
+// Tracing: real macros when the feature is on, no-ops when off.
+#[cfg(feature = "tracing")]
 use tracing::{info, trace, warn};
+
+#[cfg(not(feature = "tracing"))]
+mod no_trace {
+    macro_rules! info  { ($($t:tt)*) => {} }
+    macro_rules! trace { ($($t:tt)*) => {} }
+    macro_rules! warn  { ($($t:tt)*) => {} }
+    pub(crate) use {info, trace, warn};
+}
+#[cfg(not(feature = "tracing"))]
+use no_trace::{info, trace, warn};
 
 /// RTT calculation state
 #[derive(Debug, Default)]
@@ -36,14 +49,14 @@ struct ProbeState {
     ts: Timestamp,
 }
 
-/// Async KCP engine implementing the core protocol logic
+/// Synchronous KCP engine implementing the core protocol logic.
 ///
 /// All methods are synchronous. Output packets are buffered in `output_queue`
 /// and must be drained by the caller via [`drain_output`](Self::drain_output).
 pub struct KcpEngine {
     // Core
     conv: ConvId,
-    config: KcpConfig,
+    config: KcpCoreConfig,
 
     // Sequence numbers
     snd_una: SeqNum,
@@ -75,7 +88,8 @@ pub struct KcpEngine {
 
 impl KcpEngine {
     /// Create a new KCP engine
-    pub fn new(conv: ConvId, config: KcpConfig) -> Self {
+    pub fn new(conv: ConvId, config: impl Into<KcpCoreConfig>) -> Self {
+        let config = config.into();
         let min_rto = if config.nodelay.nodelay {
             constants::IKCP_RTO_NDL
         } else {
@@ -125,7 +139,7 @@ impl KcpEngine {
     }
 
     /// Start the engine
-    pub fn start(&mut self) -> Result<()> {
+    pub fn start(&mut self) -> KcpCoreResult<()> {
         info!(conv = %self.conv, "KCP engine started");
         Ok(())
     }
@@ -137,7 +151,7 @@ impl KcpEngine {
     }
 
     /// Send data through KCP
-    pub fn send(&mut self, data: Bytes) -> Result<()> {
+    pub fn send(&mut self, data: Bytes) -> KcpCoreResult<()> {
         self.last_activity = current_timestamp();
         if data.is_empty() {
             return Ok(());
@@ -176,7 +190,7 @@ impl KcpEngine {
 
         // Check if we can send all fragments
         if count >= constants::IKCP_WND_RCV as usize {
-            return Err(KcpError::buffer("Message too large for window"));
+            return Err(KcpCoreError::buffer("Message too large for window"));
         }
 
         // Fragment the data
@@ -212,7 +226,7 @@ impl KcpEngine {
     }
 
     /// Receive data from KCP
-    pub fn recv(&mut self) -> Result<Option<Bytes>> {
+    pub fn recv(&mut self) -> KcpCoreResult<Option<Bytes>> {
         if self.rcv_queue.is_empty() {
             return Ok(None);
         }
@@ -223,8 +237,8 @@ impl KcpEngine {
             return Ok(None);
         }
 
-        // Assemble the message from fragments using optimized buffer pool
-        let mut data = crate::common::try_get_buffer(peek_size as usize);
+        // Assemble the message from fragments
+        let mut data = BytesMut::with_capacity(peek_size as usize);
         let mut recovered = false;
 
         // Check if we were window-limited before
@@ -271,28 +285,36 @@ impl KcpEngine {
     }
 
     /// Process incoming packet
-    pub fn input(&mut self, data: Bytes) -> Result<()> {
+    pub fn input(&mut self, data: Bytes) -> KcpCoreResult<()> {
         let current = current_timestamp();
         self.last_activity = current;
         if data.len() < KcpHeader::SIZE {
-            return Err(KcpError::protocol("Packet too small"));
+            return Err(KcpCoreError::protocol("Packet too small"));
         }
 
         let original_size = data.len();
         let mut buf = data;
         let mut flag = false;
         let mut max_ack = 0;
-        let mut latest_ts = 0;
 
         // Process all segments in the packet
         while buf.len() >= KcpHeader::SIZE {
-            let segment = match KcpSegment::decode(buf.clone()) {
-                Some(seg) => {
-                    buf = buf.slice(seg.size()..);
-                    seg
-                }
+            // Peek at header to determine segment size, then slice exact range
+            // (Bytes::slice is O(1) ref-count vs clone's O(n) copy)
+            let mut header_buf = buf.clone();
+            let header = match KcpHeader::decode(&mut header_buf) {
+                Some(h) => h,
                 None => break,
             };
+            let seg_len = KcpHeader::SIZE + header.len as usize;
+            if buf.len() < seg_len {
+                break;
+            }
+            let segment = match KcpSegment::decode(buf.slice(..seg_len)) {
+                Some(seg) => seg,
+                None => break,
+            };
+            buf = buf.slice(seg_len..);
 
             // Verify conversation ID — skip this segment but keep processing the rest
             if segment.header.conv != self.conv {
@@ -309,7 +331,6 @@ impl KcpEngine {
 
             // Process UNA (unacknowledged sequence number)
             self.parse_una(segment.header.una);
-            self.shrink_buf();
 
             match segment.header.cmd {
                 constants::IKCP_CMD_ACK => {
@@ -320,15 +341,12 @@ impl KcpEngine {
                     }
 
                     self.parse_ack(segment.header.sn);
-                    self.shrink_buf();
 
                     if !flag {
                         flag = true;
                         max_ack = segment.header.sn;
-                        latest_ts = segment.header.ts;
                     } else if seq_after(segment.header.sn, max_ack) {
                         max_ack = segment.header.sn;
-                        latest_ts = segment.header.ts;
                     }
                 }
 
@@ -363,9 +381,12 @@ impl KcpEngine {
             }
         }
 
+        // Single shrink_buf after all segments processed
+        self.shrink_buf();
+
         // Process fast ACK
         if flag {
-            self.parse_fastack(max_ack, latest_ts);
+            self.parse_fastack(max_ack);
         }
 
         // Update congestion window
@@ -383,11 +404,11 @@ impl KcpEngine {
     }
 
     /// Flush pending data and ACKs
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self) -> KcpCoreResult<()> {
         let current = current_timestamp();
 
         // Flush ACKs
-        self.flush_acks(current)?;
+        self.flush_acks()?;
 
         // Handle window probing
         self.handle_window_probe(current)?;
@@ -405,7 +426,7 @@ impl KcpEngine {
     }
 
     /// Update KCP state (called periodically)
-    pub fn update(&mut self) -> Result<()> {
+    pub fn update(&mut self) -> KcpCoreResult<()> {
         let current = current_timestamp();
 
         if current < self.last_update {
@@ -438,7 +459,7 @@ impl KcpEngine {
     }
 
     /// Trigger a window probe to keep the connection alive
-    pub fn keep_alive_probe(&mut self) -> Result<()> {
+    pub fn keep_alive_probe(&mut self) -> KcpCoreResult<()> {
         self.probe.flags |= constants::IKCP_ASK_SEND;
         self.flush()
     }
@@ -485,10 +506,12 @@ impl KcpEngine {
             return;
         }
 
-        self.snd_buf.retain(|seg| seg.header.sn != sn);
+        if let Some(pos) = self.snd_buf.iter().position(|s| s.header.sn == sn) {
+            self.snd_buf.remove(pos);
+        }
     }
 
-    fn parse_fastack(&mut self, sn: SeqNum, _ts: Timestamp) {
+    fn parse_fastack(&mut self, sn: SeqNum) {
         if seq_before(sn, self.snd_una) || !seq_before(sn, self.snd_nxt) {
             return;
         }
@@ -566,32 +589,27 @@ impl KcpEngine {
         }
     }
 
-    fn flush_acks(&mut self, _current: Timestamp) -> Result<()> {
-        let ack_count = self.ack_list.len();
-        if ack_count == 0 {
+    fn flush_acks(&mut self) -> KcpCoreResult<()> {
+        if self.ack_list.is_empty() {
             return Ok(());
         }
 
         let wnd = self.wnd_unused() as u16;
         let una = self.rcv_nxt;
 
-        let mut segments = Vec::with_capacity(ack_count);
-
-        for (sn, ts) in self.ack_list.drain(..) {
+        // Drain ack_list into a temporary to avoid borrow conflict with self
+        let acks: Vec<_> = self.ack_list.drain(..).collect();
+        for (sn, ts) in acks {
             let mut seg = KcpSegment::ack(self.conv, sn, ts);
             seg.header.wnd = wnd;
             seg.header.una = una;
-            segments.push(seg);
-        }
-
-        for segment in segments {
-            self.output_segment(segment)?;
+            self.output_segment(seg)?;
         }
 
         Ok(())
     }
 
-    fn handle_window_probe(&mut self, current: Timestamp) -> Result<()> {
+    fn handle_window_probe(&mut self, current: Timestamp) -> KcpCoreResult<()> {
         if self.wnd.rmt == 0 {
             if self.probe.wait == 0 {
                 self.probe.wait = constants::IKCP_PROBE_INIT;
@@ -656,7 +674,7 @@ impl KcpEngine {
         }
     }
 
-    fn flush_data_segments(&mut self, current: Timestamp) -> Result<()> {
+    fn flush_data_segments(&mut self, current: Timestamp) -> KcpCoreResult<()> {
         let resend = if self.config.nodelay.resend > 0 {
             self.config.nodelay.resend
         } else {
@@ -669,9 +687,37 @@ impl KcpEngine {
             self.rtt.rto / 8
         };
 
+        let (send_indices, lost, change) =
+            self.mark_segments_for_send(current, resend, rtomin);
+
+        for i in send_indices {
+            let segment = &self.snd_buf[i];
+            let is_dead = segment.xmit >= self.dead_link;
+            let mut buf = BytesMut::with_capacity(segment.size());
+            segment.encode(&mut buf);
+            self.output_queue.push(buf.freeze());
+            self.stats.packets_sent += 1;
+
+            if is_dead {
+                return Err(KcpCoreError::connection_lost());
+            }
+        }
+
+        self.update_congestion_on_loss(lost, change, resend);
+
+        Ok(())
+    }
+
+    /// Scan snd_buf and determine which segments need (re)transmission.
+    /// Returns (indices to send, lost flag, change flag).
+    fn mark_segments_for_send(
+        &mut self,
+        current: Timestamp,
+        resend: u32,
+        rtomin: u32,
+    ) -> (Vec<usize>, bool, bool) {
         let mut lost = false;
         let mut change = false;
-
         let mut send_indices: Vec<usize> = Vec::new();
         let wnd_unused = self.wnd_unused() as u16;
         let rcv_nxt = self.rcv_nxt;
@@ -680,13 +726,11 @@ impl KcpEngine {
             let mut needsend = false;
 
             if segment.xmit == 0 {
-                // First transmission
                 needsend = true;
                 segment.xmit = 1;
                 segment.rto = self.rtt.rto;
                 segment.resendts = current + segment.rto + rtomin;
             } else if time_diff(current, segment.resendts) >= 0 {
-                // Timeout retransmission
                 needsend = true;
                 segment.xmit += 1;
                 self.xmit_count += 1;
@@ -705,43 +749,31 @@ impl KcpEngine {
 
                 segment.resendts = current + segment.rto;
                 lost = true;
-            } else if segment.fastack >= resend {
-                // Fast retransmission
-                if segment.xmit <= constants::IKCP_FASTACK_LIMIT
-                    || constants::IKCP_FASTACK_LIMIT == 0
-                {
-                    needsend = true;
-                    segment.xmit += 1;
-                    segment.fastack = 0;
-                    segment.resendts = current + segment.rto;
-                    self.stats.fast_retransmissions += 1;
-                    change = true;
-                }
+            } else if segment.fastack >= resend
+                && (segment.xmit <= constants::IKCP_FASTACK_LIMIT
+                    || constants::IKCP_FASTACK_LIMIT == 0)
+            {
+                needsend = true;
+                segment.xmit += 1;
+                segment.fastack = 0;
+                segment.resendts = current + segment.rto;
+                self.stats.fast_retransmissions += 1;
+                change = true;
             }
 
             if needsend {
                 segment.header.ts = current;
                 segment.header.wnd = wnd_unused;
                 segment.header.una = rcv_nxt;
-
                 send_indices.push(i);
             }
         }
 
-        for i in send_indices {
-            let segment = &self.snd_buf[i];
-            let is_dead = segment.xmit >= self.dead_link;
-            let mut buf = crate::common::try_get_buffer(segment.size());
-            segment.encode(&mut buf);
-            self.output_queue.push(buf.freeze());
-            self.stats.packets_sent += 1;
+        (send_indices, lost, change)
+    }
 
-            if is_dead {
-                return Err(KcpError::connection(ConnectionError::Lost));
-            }
-        }
-
-        // Update congestion control state
+    /// Update congestion window after segment transmission.
+    fn update_congestion_on_loss(&mut self, lost: bool, change: bool, resend: u32) {
         if change {
             let inflight = self.snd_nxt - self.snd_una;
             self.wnd.ssthresh = inflight / 2;
@@ -760,8 +792,6 @@ impl KcpEngine {
         if self.wnd.cwnd < 1 {
             self.reset_cwnd();
         }
-
-        Ok(())
     }
 
     fn update_cwnd(&mut self) {
@@ -798,8 +828,8 @@ impl KcpEngine {
         self.stats.rcv_buf_size = self.rcv_buf.len() as u32;
     }
 
-    fn output_segment(&mut self, segment: KcpSegment) -> Result<()> {
-        let mut buf = crate::common::try_get_buffer(segment.size());
+    fn output_segment(&mut self, segment: KcpSegment) -> KcpCoreResult<()> {
+        let mut buf = BytesMut::with_capacity(segment.size());
         segment.encode(&mut buf);
         self.output_queue.push(buf.freeze());
         self.stats.packets_sent += 1;

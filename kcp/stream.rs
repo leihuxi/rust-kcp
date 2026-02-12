@@ -1,7 +1,7 @@
 //! High-level async KCP stream interface
 
-use crate::async_kcp::actor::{run_engine_actor, EngineHandle};
-use crate::async_kcp::engine::KcpEngine;
+use crate::actor::{run_engine_actor, EngineHandle};
+use crate::engine::KcpEngine;
 use crate::common::*;
 use crate::config::KcpConfig;
 use crate::error::{ConnectionError, KcpError, Result};

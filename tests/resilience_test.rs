@@ -1,9 +1,12 @@
 //! Resilience tests for KCP protocol: packet loss recovery, out-of-order
 //! delivery, concurrent connections, and large message / sustained throughput.
 
+mod common;
+
 use bytes::Bytes;
-use kcp_tokio::async_kcp::engine::KcpEngine;
-use kcp_tokio::async_kcp::{KcpListener, KcpStream};
+use common::transfer;
+use kcp_tokio::engine::KcpEngine;
+use kcp_tokio::{KcpListener, KcpStream};
 use kcp_tokio::config::KcpConfig;
 use rand::seq::SliceRandom;
 use rand::Rng;
@@ -60,13 +63,6 @@ fn lossy_reorder_transfer(
         }
     }
     (total, delivered)
-}
-
-/// Perfect transfer (no loss, no reorder).
-fn transfer(src: &mut KcpEngine, dst: &mut KcpEngine) {
-    for packet in src.drain_output() {
-        let _ = dst.input(packet);
-    }
 }
 
 /// Drive both engines through multiple update/flush/transfer rounds so that

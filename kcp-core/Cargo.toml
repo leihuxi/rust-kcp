@@ -1,0 +1,15 @@
+[package]
+name = "kcp-core"
+version = "0.1.0"
+edition = "2021"
+description = "Pure synchronous KCP protocol engine"
+license = "MIT"
+repository = "https://github.com/leihuxi/rust-kcp"
+
+[features]
+default = ["tracing"]
+tracing = ["dep:tracing"]
+
+[dependencies]
+bytes = "1.0"
+tracing = { version = "0.1", optional = true }
