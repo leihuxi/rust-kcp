@@ -1,6 +1,6 @@
 [package]
 name = "kcp-tokio"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2021"
 authors = ["Leihu.Xi leihuxi@gmail.com"]
 description = "A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol"
@@ -62,6 +62,10 @@ name = "perf_test_client"
 path = "examples/perf_test_client.rs"
 
 
+
+[[bench]]
+name = "kcp_bench"
+harness = false
 
 [profile.release]
 opt-level = 3

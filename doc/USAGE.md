@@ -180,24 +180,35 @@ stream.close().await?;
 
 ### Custom Transport
 
-For special transport requirements, implement the `Transport` trait:
+For special transport requirements (e.g., DTLS, QUIC, unix sockets), implement
+the `Transport` trait with your own address type:
 
 ```rust
-use kcp_tokio::transport::Transport;
+use kcp_tokio::transport::{Transport, Addr};
+use std::future::Future;
 
 struct MyTransport { /* ... */ }
 
-#[async_trait::async_trait]
 impl Transport for MyTransport {
-    async fn send_to(&self, data: &[u8], addr: SocketAddr) -> std::io::Result<usize> { /* ... */ }
-    async fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> { /* ... */ }
-    fn local_addr(&self) -> std::io::Result<SocketAddr> { /* ... */ }
-}
+    type Addr = SocketAddr;  // Or your custom address type
 
-// Use with listener
-let transport = Arc::new(MyTransport::new());
-let listener = KcpListener::with_transport(transport, config).await?;
+    fn send_to<'a>(
+        &'a self, buf: &'a [u8], target: &'a Self::Addr,
+    ) -> impl Future<Output = std::io::Result<usize>> + Send + 'a {
+        async move { /* ... */ Ok(buf.len()) }
+    }
+
+    fn recv_from<'a>(
+        &'a self, buf: &'a mut [u8],
+    ) -> impl Future<Output = std::io::Result<(usize, Self::Addr)>> + Send + 'a {
+        async move { /* ... */ Ok((0, "127.0.0.1:0".parse().unwrap())) }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> { /* ... */ todo!() }
+}
 ```
+
+The trait uses RPITIT (no `async_trait` crate needed, no heap allocation per call).
 
 ### Monitoring Statistics
 

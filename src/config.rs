@@ -230,7 +230,7 @@ impl KcpConfig {
     pub async fn connect<A: Into<SocketAddr>>(
         self,
         addr: A,
-    ) -> Result<crate::async_kcp::KcpStream> {
+    ) -> Result<crate::async_kcp::KcpStream<crate::transport::UdpTransport>> {
         self.validate()?;
         crate::async_kcp::KcpStream::connect(addr.into(), self).await
     }
@@ -240,7 +240,7 @@ impl KcpConfig {
     pub async fn listen<A: Into<SocketAddr>>(
         self,
         addr: A,
-    ) -> Result<crate::async_kcp::KcpListener> {
+    ) -> Result<crate::async_kcp::KcpListener<crate::transport::UdpTransport>> {
         self.validate()?;
         crate::async_kcp::KcpListener::bind(addr.into(), self).await
     }

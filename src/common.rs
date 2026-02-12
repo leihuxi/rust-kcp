@@ -33,6 +33,19 @@ pub mod constants {
 /// Conversation ID type
 pub type ConvId = u32;
 
+/// Generate a random conversation ID using OS-entropy-seeded hashing.
+/// Avoids 0 since it's reserved for "unassigned" on the server side.
+pub fn random_conv_id() -> ConvId {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+    loop {
+        let id = RandomState::new().build_hasher().finish() as u32;
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
 /// Sequence number type
 pub type SeqNum = u32;
 

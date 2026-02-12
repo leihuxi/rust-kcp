@@ -106,13 +106,13 @@ impl KcpEngine {
 
             probe: ProbeState::default(),
 
-            snd_queue: VecDeque::new(),
-            rcv_queue: VecDeque::new(),
-            snd_buf: VecDeque::new(),
+            snd_queue: VecDeque::with_capacity(config.snd_wnd as usize),
+            rcv_queue: VecDeque::with_capacity(config.rcv_wnd as usize),
+            snd_buf: VecDeque::with_capacity(config.snd_wnd as usize),
             rcv_buf: BTreeMap::new(),
-            ack_list: Vec::new(),
+            ack_list: Vec::with_capacity(config.rcv_wnd as usize),
 
-            output_queue: Vec::new(),
+            output_queue: Vec::with_capacity(config.snd_wnd as usize),
 
             stats: KcpStats::default(),
             last_update: current_timestamp(),
@@ -572,10 +572,16 @@ impl KcpEngine {
             return Ok(());
         }
 
+        let wnd = self.wnd_unused() as u16;
+        let una = self.rcv_nxt;
+
         let mut segments = Vec::with_capacity(ack_count);
 
         for (sn, ts) in self.ack_list.drain(..) {
-            segments.push(KcpSegment::ack(self.conv, sn, ts));
+            let mut seg = KcpSegment::ack(self.conv, sn, ts);
+            seg.header.wnd = wnd;
+            seg.header.una = una;
+            segments.push(seg);
         }
 
         for segment in segments {
@@ -684,6 +690,7 @@ impl KcpEngine {
                 needsend = true;
                 segment.xmit += 1;
                 self.xmit_count += 1;
+                self.stats.retransmissions += 1;
 
                 if self.config.nodelay.nodelay {
                     let step = if self.config.nodelay.no_congestion_control {
@@ -707,6 +714,7 @@ impl KcpEngine {
                     segment.xmit += 1;
                     segment.fastack = 0;
                     segment.resendts = current + segment.rto;
+                    self.stats.fast_retransmissions += 1;
                     change = true;
                 }
             }

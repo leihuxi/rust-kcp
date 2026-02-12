@@ -23,7 +23,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3.6"
+kcp-tokio = "0.3.7"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -99,7 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 │         KcpSegment, KcpHeader, BufferPool, Constants         │
 ├─────────────────────────────────────────────────────────────┤
 │                    Transport Layer                           │
-│                   UDP Socket (Tokio)                         │
+│          Generic Transport trait (UDP default)               │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -163,14 +163,17 @@ cargo run --example simple_echo
 # Run all tests
 cargo test
 
+# Run resilience tests (packet loss, reorder, concurrent connections)
+cargo test --test resilience_test
+
+# Run benchmarks
+cargo bench
+
 # Run with logging
 RUST_LOG=debug cargo test -- --nocapture
 
-# Run specific test
-cargo test test_echo_debug -- --nocapture
-
 # Run clippy
-cargo clippy --all-targets
+cargo clippy --all-targets -- --deny clippy::all
 ```
 
 ## Documentation
@@ -195,11 +198,13 @@ KCP provides significant latency improvements over TCP:
 ### Optimizations in this Implementation
 
 - **Actor-based lock-free architecture**: KcpEngine runs in a single dedicated tokio task, eliminating `Arc<Mutex<>>` contention
+- **Generic Transport trait**: Associated `Addr` type with RPITIT — zero heap allocation on hot path (no `Pin<Box<dyn Future>>`)
 - **DashMap for packet routing**: Listener uses lock-free concurrent hashmap on the hot path
 - **Lock-free buffer pools**: `crossbeam::queue::ArrayQueue` for zero-allocation fast path
 - **BTreeMap receive buffer**: O(log n) insertion for out-of-order packets (vs O(n) linear scan)
 - **Zero-copy segment encoding**: Flush avoids cloning segments, encodes by reference
 - **Cached timestamps**: Single syscall per `input()` call instead of 3+
+- **Pre-allocated buffers**: `VecDeque::with_capacity` based on window sizes, avoiding grow overhead on send burst
 - **Zero-copy packet handling** with `bytes` crate
 - Grouped state structs for better cache locality
 - Configurable update intervals (3-40ms)
@@ -233,9 +238,24 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 - [KCP Protocol Documentation](https://github.com/skywind3000/kcp/blob/master/README.en.md)
 - [Tokio Documentation](https://tokio.rs/)
 
+## Benchmarks
+
+Criterion benchmarks measure engine-level throughput and latency:
+
+```bash
+cargo bench
+```
+
+| Benchmark | Description |
+|-----------|-------------|
+| `engine_throughput` | 10/100/500 x 1KB messages |
+| `engine_small_messages` | 1000 x 64B messages |
+| `engine_large_message` | Single 16KB/64KB message fragmentation + reassembly |
+
 ## Version History
 
-- **v0.3.6**: Actor-based lock-free architecture, DashMap packet routing, BTreeMap receive buffer, zero-copy segment encoding, timestamp caching
+- **v0.3.7** (next): Fix ACK window/UNA fields (critical flow control bug), generic Transport trait with RPITIT, resilience tests, criterion benchmarks, VecDeque pre-allocation, retransmission stats tracking
+- **v0.3.7**: Actor-based lock-free architecture, DashMap packet routing, BTreeMap receive buffer, zero-copy segment encoding, timestamp caching
 - **v0.3.4**: Engine refactoring, lock-free buffer pools, documentation
 - **v0.3.3**: Performance optimizations, sub-millisecond latency
 - **v0.3.1**: Full async support, comprehensive configuration

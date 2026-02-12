@@ -7,7 +7,6 @@ use crate::error::Result;
 use crate::transport::Transport;
 
 use bytes::Bytes;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::MissedTickBehavior;
@@ -114,13 +113,13 @@ impl EngineHandle {
 /// - `input_rx`: raw UDP packets from recv_task (client) or listener (server).
 /// - `data_tx`: assembled application messages forwarded to user reads.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_engine_actor(
+pub(crate) async fn run_engine_actor<T: Transport>(
     mut engine: KcpEngine,
     mut cmd_rx: mpsc::Receiver<EngineCmd>,
     mut input_rx: mpsc::Receiver<Bytes>,
     data_tx: mpsc::Sender<Bytes>,
-    transport: Arc<dyn Transport>,
-    peer_addr: SocketAddr,
+    transport: Arc<T>,
+    peer_addr: T::Addr,
     update_interval_ms: u64,
     keep_alive_ms: Option<u64>,
 ) {
@@ -130,7 +129,7 @@ pub(crate) async fn run_engine_actor(
     // Initial update + flush + drain any pre-loaded messages
     // (server streams may have processed initial packets before spawning the actor)
     let _ = engine.update();
-    flush_output(&mut engine, &transport, peer_addr).await;
+    flush_output(&mut engine, &transport, &peer_addr).await;
     drain_recv(&mut engine, &data_tx);
 
     loop {
@@ -158,7 +157,7 @@ pub(crate) async fn run_engine_actor(
                     }
                 }
 
-                flush_output(&mut engine, &transport, peer_addr).await;
+                flush_output(&mut engine, &transport, &peer_addr).await;
             }
 
             // User commands
@@ -166,12 +165,12 @@ pub(crate) async fn run_engine_actor(
                 match cmd {
                     Some(EngineCmd::Send { data, reply }) => {
                         let r = engine.send(data);
-                        flush_output(&mut engine, &transport, peer_addr).await;
+                        flush_output(&mut engine, &transport, &peer_addr).await;
                         let _ = reply.send(r);
                     }
                     Some(EngineCmd::Flush { reply }) => {
                         let r = engine.flush();
-                        flush_output(&mut engine, &transport, peer_addr).await;
+                        flush_output(&mut engine, &transport, &peer_addr).await;
                         let _ = reply.send(r);
                     }
                     Some(EngineCmd::Stats { reply }) => {
@@ -183,7 +182,7 @@ pub(crate) async fn run_engine_actor(
                     Some(EngineCmd::Close) | None => {
                         // Graceful shutdown: flush remaining data
                         let _ = engine.flush();
-                        flush_output(&mut engine, &transport, peer_addr).await;
+                        flush_output(&mut engine, &transport, &peer_addr).await;
                         break;
                     }
                 }
@@ -194,7 +193,7 @@ pub(crate) async fn run_engine_actor(
                 match packet {
                     Some(data) => {
                         let _ = engine.input(data);
-                        flush_output(&mut engine, &transport, peer_addr).await;
+                        flush_output(&mut engine, &transport, &peer_addr).await;
                         drain_recv(&mut engine, &data_tx);
                     }
                     None => {
@@ -209,7 +208,7 @@ pub(crate) async fn run_engine_actor(
 }
 
 /// Send all buffered output packets over the transport.
-async fn flush_output(engine: &mut KcpEngine, transport: &Arc<dyn Transport>, peer: SocketAddr) {
+async fn flush_output<T: Transport>(engine: &mut KcpEngine, transport: &Arc<T>, peer: &T::Addr) {
     for buf in engine.drain_output() {
         if let Err(e) = transport.send_to(&buf, peer).await {
             trace!(error = %e, "Transport send_to failed");

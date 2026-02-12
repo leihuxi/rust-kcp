@@ -46,6 +46,18 @@ RUST_LOG=debug cargo test -- --nocapture
 RUST_LOG=trace cargo test test_echo_debug -- --nocapture
 ```
 
+## Test Summary
+
+| Test File | Tests | Description |
+|-----------|-------|-------------|
+| Unit tests (`src/lib.rs`) | 3 | Version, metrics, connection monitor |
+| `echo_test.rs` | 2 | Basic echo and multi-message |
+| `integration_test.rs` | 5 | Send/recv, bidirectional, fragmentation |
+| `simple_test.rs` | 5 | Configuration and message basics |
+| `simple_kcp_test.rs` | 1 | Minimal KCP echo |
+| `resilience_test.rs` | 6 | Packet loss, reorder, concurrent, large message, throughput |
+| **Total** | **23** | |
+
 ## Test Categories
 
 ### Unit Tests (`src/lib.rs`)
@@ -87,6 +99,57 @@ fn test_connection_monitor() {
 | `integration_test.rs` | Comprehensive integration (send/recv, bidirectional, fragmentation) |
 | `simple_test.rs` | Simple configuration and message tests |
 | `simple_kcp_test.rs` | Minimal KCP echo test |
+| `resilience_test.rs` | Protocol resilience under adverse network conditions |
+
+### Resilience Tests (`tests/resilience_test.rs`)
+
+These tests verify KCP's core protocol guarantees under adverse network conditions.
+They use engine-level helpers (`lossy_transfer`, `reorder_transfer`) to simulate
+network impairments without real UDP, providing deterministic and fast testing.
+
+| Test | Level | Description |
+|------|-------|-------------|
+| `test_packet_loss_recovery` | Engine | 10 messages with 20% bidirectional loss; verifies all arrive via retransmission |
+| `test_out_of_order_delivery` | Engine | Small MTU forces fragmentation; packets delivered in shuffled order; verifies reassembly |
+| `test_loss_and_reorder_combined` | Engine | 20% loss + reorder simultaneously; drains receiver each round |
+| `test_concurrent_connections` | Async | 5 concurrent clients through real KcpListener; verifies DashMap routing isolation |
+| `test_large_message_delivery` | Engine | Single 64KB message (~47 fragments); verifies fragmentation + flow control |
+| `test_sustained_throughput` | Engine | 100 x 1KB messages exceeding snd_wnd=32; verifies flow control with receiver draining |
+
+**Key design decisions:**
+
+- **Real-time delays between rounds**: Lossy tests use `tokio::time::sleep(50ms)` batches
+  so RTO timers can fire and trigger retransmission (tight loops run in microseconds,
+  but RTO defaults to 200ms).
+- **Receiver draining**: Tests that exceed the receive window use `run_rounds_draining()`
+  to simulate an application reading data each round, preventing `rcv_queue` from filling
+  up and advertising `wnd=0` to the sender.
+
+```bash
+# Run resilience tests only
+cargo test --test resilience_test
+
+# Run a specific resilience test
+cargo test --test resilience_test test_packet_loss_recovery
+```
+
+### Criterion Benchmarks (`benches/kcp_bench.rs`)
+
+Engine-level benchmarks measuring throughput and latency with perfect transfer (no loss).
+
+| Benchmark | Parameters | Metric |
+|-----------|-----------|--------|
+| `engine_throughput` | 10/100/500 x 1KB | Bytes/sec |
+| `engine_small_messages` | 1000 x 64B | Elements/sec |
+| `engine_large_message` | Single 16KB/64KB | Bytes/sec (fragmentation + reassembly) |
+
+```bash
+# Run all benchmarks
+cargo bench
+
+# Run in test mode (verify correctness only, no timing)
+cargo bench -- --test
+```
 
 ## Test Structure
 

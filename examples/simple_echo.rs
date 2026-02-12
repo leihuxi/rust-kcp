@@ -66,7 +66,7 @@ async fn run_server(addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> 
 }
 
 async fn handle_client(mut stream: KcpStream) -> Result<(), Box<dyn std::error::Error>> {
-    let peer_addr = stream.peer_addr();
+    let peer_addr = *stream.peer_addr();
     info!("Handling client {}", peer_addr);
 
     let mut buffer = [0u8; 1024];

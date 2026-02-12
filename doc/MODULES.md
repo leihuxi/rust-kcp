@@ -9,14 +9,22 @@ kcp-tokio/
 │   ├── config.rs           # Configuration types
 │   ├── error.rs            # Error types
 │   ├── common.rs           # Shared types and utilities
+│   ├── transport.rs        # Generic Transport trait + UdpTransport
 │   ├── metrics.rs          # Performance monitoring
 │   └── async_kcp/
-│       ├── mod.rs          # Module exports
 │       ├── mod.rs          # Module exports
 │       ├── actor.rs        # Actor task (owns KcpEngine)
 │       ├── engine.rs       # KCP protocol core
 │       ├── stream.rs       # High-level stream API
 │       └── listener.rs     # Server listener
+├── tests/
+│   ├── echo_test.rs        # Basic echo tests
+│   ├── integration_test.rs # Comprehensive integration tests
+│   ├── simple_test.rs      # Configuration and message tests
+│   ├── simple_kcp_test.rs  # Minimal KCP echo
+│   └── resilience_test.rs  # Protocol resilience (loss, reorder, concurrent)
+└── benches/
+    └── kcp_bench.rs        # Criterion benchmarks
 ```
 
 ---
@@ -39,6 +47,7 @@ pub mod metrics;
 pub use config::KcpConfig;
 pub use error::{KcpError, Result};
 pub use async_kcp::*;
+pub use transport::{Transport, Addr, UdpTransport};
 
 // Constants
 pub const VERSION: &str;
@@ -423,6 +432,49 @@ pub struct KcpListener {
 | `bind(addr, config)` | Bind to address |
 | `accept()` | Accept new connection |
 | `local_addr()` | Get bound address |
+
+---
+
+## `transport.rs` - Transport Abstraction
+
+**Purpose:** Generic datagram transport trait, decoupling KCP from UDP.
+
+### `Addr` Trait
+
+Marker trait for address types, automatically implemented for types satisfying bounds:
+
+```rust
+pub trait Addr: Clone + Eq + Hash + Send + Sync + Debug + Display + 'static {}
+```
+
+### `Transport` Trait
+
+```rust
+pub trait Transport: Send + Sync + 'static {
+    type Addr: Addr;
+
+    fn send_to<'a>(
+        &'a self, buf: &'a [u8], target: &'a Self::Addr,
+    ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
+
+    fn recv_from<'a>(
+        &'a self, buf: &'a mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, Self::Addr)>> + Send + 'a;
+
+    fn local_addr(&self) -> io::Result<Self::Addr>;
+}
+```
+
+Uses RPITIT (Rust 1.75+) for zero-allocation futures on the hot path.
+
+### `UdpTransport`
+
+Built-in implementation wrapping `tokio::net::UdpSocket`:
+
+| Method | Description |
+|--------|-------------|
+| `bind(addr)` | Bind a new UDP socket |
+| `new(socket)` | Wrap an existing `UdpSocket` |
 
 ---
 

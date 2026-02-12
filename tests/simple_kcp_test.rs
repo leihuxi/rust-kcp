@@ -17,7 +17,7 @@ async fn test_simple_kcp_echo() {
             .await
             .expect("Failed to bind");
 
-        addr_tx.send(listener.local_addr()).unwrap();
+        addr_tx.send(*listener.local_addr()).unwrap();
 
         let (mut stream, _peer) = timeout(Duration::from_secs(10), listener.accept())
             .await

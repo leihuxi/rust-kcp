@@ -23,7 +23,7 @@ KCP-Rust is a high-performance async implementation of the KCP (Fast and Reliabl
 │         KcpSegment, KcpHeader, BufferPool, Constants         │
 ├─────────────────────────────────────────────────────────────┤
 │                    Transport Layer                           │
-│                   UDP Socket (Tokio)                         │
+│       Generic Transport trait (UdpTransport default)         │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -249,15 +249,46 @@ pub enum KcpError {
 }
 ```
 
+## Transport Layer
+
+The `Transport` trait (`src/transport.rs`) abstracts the datagram transport, allowing
+KCP to run over any async datagram transport, not just UDP.
+
+```rust
+pub trait Transport: Send + Sync + 'static {
+    type Addr: Addr;  // Associated address type (SocketAddr for UDP)
+
+    fn send_to<'a>(
+        &'a self, buf: &'a [u8], target: &'a Self::Addr,
+    ) -> impl Future<Output = io::Result<usize>> + Send + 'a;
+
+    fn recv_from<'a>(
+        &'a self, buf: &'a mut [u8],
+    ) -> impl Future<Output = io::Result<(usize, Self::Addr)>> + Send + 'a;
+
+    fn local_addr(&self) -> io::Result<Self::Addr>;
+}
+```
+
+**Key design decisions:**
+- **Associated `Addr` type** with `Addr` trait bound (Clone + Eq + Hash + Send + Sync + Debug + Display)
+- **RPITIT** (Return Position Impl Trait in Traits, stable since Rust 1.75) instead of
+  `Pin<Box<dyn Future>>` — eliminates heap allocation on every send/receive call
+- **Static dispatch** via `Arc<T>` instead of `Arc<dyn Transport>` — enables inlining
+
+The built-in `UdpTransport` uses `tokio::net::UdpSocket` with `Addr = SocketAddr`.
+
 ## Performance Optimizations
 
 1. **Actor-based lock-free architecture** - KcpEngine owned by single task, no `Arc<Mutex<>>`
-2. **DashMap packet routing** - Listener uses lock-free concurrent hashmap on every incoming packet
-3. **BTreeMap receive buffer** - O(log n) insert for out-of-order packets (was O(n) VecDeque scan + shift)
-4. **Zero-copy segment flush** - `flush_data_segments()` encodes by reference, no `segment.clone()`
-5. **Cached timestamps** - Single `current_timestamp()` syscall per `input()` (was 3+)
-6. **Lock-free Buffer Pool** - Crossbeam ArrayQueue for zero-allocation fast path
-7. **Batch ACK Processing** - Pre-allocated vectors
-8. **Inline Helper Methods** - `mss()`, `reset_cwnd()`
-9. **Grouped State Structs** - Better cache locality
-10. **Configurable Update Intervals** - 3-40ms based on mode
+2. **Generic Transport with RPITIT** - Zero heap allocation on send/receive hot path
+3. **DashMap packet routing** - Listener uses lock-free concurrent hashmap on every incoming packet
+4. **BTreeMap receive buffer** - O(log n) insert for out-of-order packets (was O(n) VecDeque scan + shift)
+5. **Zero-copy segment flush** - `flush_data_segments()` encodes by reference, no `segment.clone()`
+6. **Cached timestamps** - Single `current_timestamp()` syscall per `input()` (was 3+)
+7. **Pre-allocated buffers** - `VecDeque::with_capacity` based on window sizes, avoiding grow on send burst
+8. **Lock-free Buffer Pool** - Crossbeam ArrayQueue for zero-allocation fast path
+9. **Batch ACK Processing** - Pre-allocated vectors
+10. **Inline Helper Methods** - `mss()`, `reset_cwnd()`
+11. **Grouped State Structs** - Better cache locality
+12. **Configurable Update Intervals** - 3-40ms based on mode

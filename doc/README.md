@@ -41,8 +41,10 @@ kcp-rust/
 │   ├── config.rs        # Configuration
 │   ├── error.rs         # Error types
 │   ├── common.rs        # Shared types
+│   ├── transport.rs     # Generic Transport trait + UdpTransport
 │   ├── metrics.rs       # Monitoring
 │   └── async_kcp/
+│       ├── actor.rs     # Actor task (owns KcpEngine)
 │       ├── engine.rs    # Protocol core
 │       ├── stream.rs    # Stream API
 │       └── listener.rs  # Server listener
@@ -51,13 +53,18 @@ kcp-rust/
 │   ├── perf_test_server.rs
 │   └── perf_test_client.rs
 ├── tests/
-│   └── *.rs             # Integration tests
+│   ├── echo_test.rs         # Basic echo tests
+│   ├── integration_test.rs  # Comprehensive integration
+│   ├── resilience_test.rs   # Protocol resilience (loss, reorder, concurrent)
+│   └── ...
+├── benches/
+│   └── kcp_bench.rs     # Criterion benchmarks
 └── doc/
     └── *.md             # Documentation
 ```
 
 ## Version
 
-- Library Version: 0.3.6
+- Library Version: 0.3.7
 - Protocol Version: 1
 - Rust Edition: 2021

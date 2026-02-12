@@ -5,7 +5,7 @@ use crate::async_kcp::engine::KcpEngine;
 use crate::common::*;
 use crate::config::KcpConfig;
 use crate::error::{ConnectionError, KcpError, Result};
-use crate::transport::Transport;
+use crate::transport::{Transport, UdpTransport};
 
 use bytes::{Buf, Bytes, BytesMut};
 use std::future::Future;
@@ -19,12 +19,12 @@ use tokio::sync::mpsc;
 use tracing::{info, trace};
 
 /// High-level async KCP stream providing TCP-like interface over UDP
-pub struct KcpStream {
+pub struct KcpStream<T: Transport = UdpTransport> {
     handle: EngineHandle,
     pub(crate) input_tx: mpsc::Sender<Bytes>,
     data_rx: mpsc::Receiver<Bytes>,
-    transport: Arc<dyn Transport>,
-    peer_addr: SocketAddr,
+    transport: Arc<T>,
+    peer_addr: T::Addr,
 
     // Read/write state
     read_buf: BytesMut,
@@ -40,10 +40,12 @@ pub struct KcpStream {
     closed: bool,
 }
 
-impl KcpStream {
+// --- UDP-specific convenience methods ---
+
+impl KcpStream<UdpTransport> {
     /// Connect to a remote KCP server
     pub async fn connect(addr: SocketAddr, config: KcpConfig) -> Result<Self> {
-        let transport = crate::transport::UdpTransport::bind("0.0.0.0:0")
+        let transport = UdpTransport::bind("0.0.0.0:0")
             .await
             .map_err(KcpError::Io)?;
         let transport = Arc::new(transport);
@@ -54,11 +56,15 @@ impl KcpStream {
 
         Self::connect_with_transport(transport, addr, config).await
     }
+}
 
+// --- Generic methods for any Transport ---
+
+impl<T: Transport> KcpStream<T> {
     /// Connect to a remote KCP server using a custom [`Transport`].
     pub async fn connect_with_transport(
-        transport: Arc<dyn Transport>,
-        addr: SocketAddr,
+        transport: Arc<T>,
+        addr: T::Addr,
         config: KcpConfig,
     ) -> Result<Self> {
         Self::new_with_transport(transport, addr, config, true).await
@@ -66,8 +72,8 @@ impl KcpStream {
 
     /// Create a new KCP stream with a specific conversation ID (for server side)
     pub async fn new_with_conv(
-        transport: Arc<dyn Transport>,
-        peer_addr: SocketAddr,
+        transport: Arc<T>,
+        peer_addr: T::Addr,
         conv: ConvId,
         config: KcpConfig,
     ) -> Result<Self> {
@@ -83,19 +89,20 @@ impl KcpStream {
         let keep_alive_ms = config.keep_alive.map(|d| d.as_millis() as u64);
 
         let transport_actor = transport.clone();
+        let actor_peer = peer_addr.clone();
         let actor_task = tokio::spawn(run_engine_actor(
             engine,
             cmd_rx,
             input_rx,
             data_tx,
             transport_actor,
-            peer_addr,
+            actor_peer,
             update_interval,
             keep_alive_ms,
         ));
 
         // Client: spawn recv_task that reads from transport → input_tx
-        let recv_task = Self::spawn_recv_task(transport.clone(), input_tx.clone(), peer_addr);
+        let recv_task = Self::spawn_recv_task(transport.clone(), input_tx.clone(), peer_addr.clone());
 
         let stream = Self {
             handle,
@@ -112,14 +119,14 @@ impl KcpStream {
             closed: false,
         };
 
-        info!(peer = %peer_addr, conv = conv, "KCP stream established");
+        info!(peer = %stream.peer_addr, conv = conv, "KCP stream established");
         Ok(stream)
     }
 
     /// Create a new server-side KCP stream (with proper routing)
     pub async fn new_server_stream(
-        transport: Arc<dyn Transport>,
-        peer_addr: SocketAddr,
+        transport: Arc<T>,
+        peer_addr: T::Addr,
         conv: ConvId,
         config: KcpConfig,
         initial_packet: Bytes,
@@ -141,13 +148,14 @@ impl KcpStream {
         let keep_alive_ms = config.keep_alive.map(|d| d.as_millis() as u64);
 
         let transport_actor = transport.clone();
+        let actor_peer = peer_addr.clone();
         let actor_task = tokio::spawn(run_engine_actor(
             engine,
             cmd_rx,
             input_rx,
             data_tx,
             transport_actor,
-            peer_addr,
+            actor_peer,
             update_interval,
             keep_alive_ms,
         ));
@@ -168,19 +176,19 @@ impl KcpStream {
             closed: false,
         };
 
-        info!(peer = %peer_addr, conv = conv, "KCP server stream established");
+        info!(peer = %stream.peer_addr, conv = conv, "KCP server stream established");
         Ok(stream)
     }
 
     /// Create a new KCP stream from an existing transport
     pub async fn new_with_transport(
-        transport: Arc<dyn Transport>,
-        peer_addr: SocketAddr,
+        transport: Arc<T>,
+        peer_addr: T::Addr,
         config: KcpConfig,
         is_client: bool,
     ) -> Result<Self> {
         let conv = if is_client {
-            0x12345678u32 // Fixed conversation ID for C server compatibility
+            random_conv_id() // Random conv ID per connection to avoid collisions
         } else {
             0 // Server will use the conversation ID from the first packet
         };
@@ -209,13 +217,13 @@ impl KcpStream {
     }
 
     /// Get local address
-    pub fn local_addr(&self) -> Result<SocketAddr> {
+    pub fn local_addr(&self) -> Result<T::Addr> {
         self.transport.local_addr().map_err(KcpError::Io)
     }
 
     /// Get peer address
-    pub fn peer_addr(&self) -> SocketAddr {
-        self.peer_addr
+    pub fn peer_addr(&self) -> &T::Addr {
+        &self.peer_addr
     }
 
     /// Get connection statistics
@@ -260,9 +268,9 @@ impl KcpStream {
 
     /// Spawn a recv_task that reads from transport and feeds input_tx
     fn spawn_recv_task(
-        transport: Arc<dyn Transport>,
+        transport: Arc<T>,
         input_tx: mpsc::Sender<Bytes>,
-        peer_addr: SocketAddr,
+        peer_addr: T::Addr,
     ) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
@@ -293,7 +301,10 @@ impl KcpStream {
     }
 }
 
-impl Drop for KcpStream {
+// KcpStream contains no self-referential pinned data, so it is safe to Unpin.
+impl<T: Transport> Unpin for KcpStream<T> {}
+
+impl<T: Transport> Drop for KcpStream<T> {
     fn drop(&mut self) {
         // Signal actor to shut down
         self.handle.close();
@@ -309,7 +320,7 @@ impl Drop for KcpStream {
 }
 
 // Implement AsyncRead trait for KcpStream
-impl AsyncRead for KcpStream {
+impl<T: Transport> AsyncRead for KcpStream<T> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -353,7 +364,7 @@ impl AsyncRead for KcpStream {
 }
 
 // Implement AsyncWrite trait for KcpStream
-impl AsyncWrite for KcpStream {
+impl<T: Transport> AsyncWrite for KcpStream<T> {
     fn poll_write(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,

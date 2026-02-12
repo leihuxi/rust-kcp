@@ -21,7 +21,7 @@ async fn spawn_echo_server(
             .expect("Failed to bind listener");
 
         // Report actual address back
-        addr_tx.send(listener.local_addr()).unwrap();
+        addr_tx.send(*listener.local_addr()).unwrap();
 
         let (mut stream, _peer_addr) = listener.accept().await.expect("Failed to accept");
 

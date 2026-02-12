@@ -63,7 +63,7 @@ pub use async_kcp::{KcpListener, KcpStream};
 
 // Transport abstraction (trait is always available; UdpTransport requires tokio)
 pub mod transport;
-pub use transport::Transport;
+pub use transport::{Addr, Transport};
 #[cfg(feature = "tokio")]
 pub use transport::UdpTransport;
 
