@@ -21,7 +21,7 @@ tokio = ["dep:tokio"]
 
 [dependencies]
 # Core protocol engine
-kcp-core = { path = "kcp-core" }
+kcp-core = { path = "kcp-core", version = "0.1.0" }
 
 # Core async runtime
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "sync", "time", "macros", "io-util", "signal"], optional = true }
