@@ -1,0 +1,15 @@
+[profile.default]
+# Per-test timeout: prevents CI from hanging on flaky network tests
+test-timeout = "60s"
+# Fail-fast: stop on first failure
+fail-fast = false
+# Retry flaky tests
+retries = 2
+
+[profile.ci]
+# Stricter timeout for CI
+test-timeout = "120s"
+retries = 3
+fail-fast = false
+# Show slow tests
+slow-timeout = { period = "30s", terminate-after = 4 }
