@@ -52,11 +52,10 @@ RUST_LOG=trace cargo test test_echo_debug -- --nocapture
 |-----------|-------|-------------|
 | Unit tests (`src/lib.rs`) | 3 | Version, metrics, connection monitor |
 | `echo_test.rs` | 2 | Basic echo and multi-message |
-| `integration_test.rs` | 5 | Send/recv, bidirectional, fragmentation |
-| `simple_test.rs` | 5 | Configuration and message basics |
-| `simple_kcp_test.rs` | 1 | Minimal KCP echo |
+| `simple_test.rs` | 6 | Configuration and message basics |
 | `resilience_test.rs` | 6 | Packet loss, reorder, concurrent, large message, throughput |
-| **Total** | **23** | |
+| `kcp-core/engine_test.rs` | 4 | Core-only engine tests (no tokio) |
+| **Total** | **21** | |
 
 ## Test Categories
 
@@ -96,10 +95,9 @@ fn test_connection_monitor() {
 | Test File | Description |
 |-----------|-------------|
 | `echo_test.rs` | Basic echo and multi-message functionality |
-| `integration_test.rs` | Comprehensive integration (send/recv, bidirectional, fragmentation) |
-| `simple_test.rs` | Simple configuration and message tests |
-| `simple_kcp_test.rs` | Minimal KCP echo test |
+| `simple_test.rs` | Configuration and message tests |
 | `resilience_test.rs` | Protocol resilience under adverse network conditions |
+| `kcp-core/tests/engine_test.rs` | Core-only engine tests (no tokio dependency) |
 
 ### Resilience Tests (`tests/resilience_test.rs`)
 
@@ -238,7 +236,7 @@ async fn debug_multiple_messages() {
 ### Test Template
 
 ```rust
-use kcp_tokio::async_kcp::{KcpListener, KcpStream};
+use kcp_tokio::{KcpListener, KcpStream};
 use kcp_tokio::config::KcpConfig;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -349,24 +347,24 @@ RUST_LOG=trace cargo test test_name -- --nocapture
 RUST_LOG=kcp_tokio=debug cargo test -- --nocapture
 
 # Specific module
-RUST_LOG=kcp_tokio::async_kcp::engine=trace cargo test -- --nocapture
+RUST_LOG=kcp_tokio::engine=trace cargo test -- --nocapture
 ```
 
 ### Common Debug Points
 
 1. **Connection issues**
    ```bash
-   RUST_LOG=kcp_tokio::async_kcp::stream=debug cargo test
+   RUST_LOG=kcp_tokio::stream=debug cargo test
    ```
 
 2. **Protocol issues**
    ```bash
-   RUST_LOG=kcp_tokio::async_kcp::engine=trace cargo test
+   RUST_LOG=kcp_tokio::engine=trace cargo test
    ```
 
 3. **Listener issues**
    ```bash
-   RUST_LOG=kcp_tokio::async_kcp::listener=debug cargo test
+   RUST_LOG=kcp_tokio::listener=debug cargo test
    ```
 
 ## Test Configuration

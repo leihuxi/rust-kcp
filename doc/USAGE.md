@@ -6,7 +6,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3"
+kcp-tokio = "0.4"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -15,7 +15,7 @@ tokio = { version = "1.0", features = ["full"] }
 ### Client Example
 
 ```rust
-use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
+use kcp_tokio::{KcpConfig, KcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server Example
 
 ```rust
-use kcp_tokio::{KcpConfig, async_kcp::KcpListener};
+use kcp_tokio::{KcpConfig, KcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -224,7 +224,7 @@ println!("Total bytes sent: {}", metrics.total_bytes_sent);
 ### Buffer Pool Statistics
 
 ```rust
-use kcp_tokio::common::buffer_pool_stats;
+use kcp_tokio::buffer_pool::buffer_pool_stats;
 
 for (name, hits, size) in buffer_pool_stats() {
     println!("{}: {} hits, {} cached", name, hits, size);

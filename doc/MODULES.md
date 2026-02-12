@@ -4,27 +4,32 @@
 
 ```
 kcp-tokio/
-├── src/
-│   ├── lib.rs              # Crate root, re-exports
-│   ├── config.rs           # Configuration types
-│   ├── error.rs            # Error types
-│   ├── common.rs           # Shared types and utilities
-│   ├── transport.rs        # Generic Transport trait + UdpTransport
-│   ├── metrics.rs          # Performance monitoring
-│   └── async_kcp/
-│       ├── mod.rs          # Module exports
-│       ├── actor.rs        # Actor task (owns KcpEngine)
-│       ├── engine.rs       # KCP protocol core
-│       ├── stream.rs       # High-level stream API
-│       └── listener.rs     # Server listener
+├── kcp-core/                   # Standalone sync protocol engine
+│   └── src/
+│       ├── lib.rs
+│       ├── protocol.rs         # Wire types & constants
+│       ├── config.rs           # KcpCoreConfig, NodeDelayConfig
+│       ├── error.rs            # KcpCoreError (3 variants)
+│       └── engine.rs           # KcpEngine (pure sync)
+├── kcp/                        # Async runtime layer
+│   ├── lib.rs                  # Crate root, re-exports
+│   ├── engine.rs               # Re-export from kcp-core
+│   ├── actor.rs                # Actor task (owns KcpEngine)
+│   ├── stream.rs               # High-level stream API
+│   ├── listener.rs             # Server listener
+│   ├── config.rs               # KcpConfig (extends core)
+│   ├── error.rs                # KcpError (extends core)
+│   ├── transport.rs            # Generic Transport trait + UdpTransport
+│   ├── buffer_pool.rs          # Lock-free buffer pool
+│   ├── common.rs               # Internal re-exports
+│   └── metrics.rs              # Performance monitoring
 ├── tests/
-│   ├── echo_test.rs        # Basic echo tests
-│   ├── integration_test.rs # Comprehensive integration tests
-│   ├── simple_test.rs      # Configuration and message tests
-│   ├── simple_kcp_test.rs  # Minimal KCP echo
-│   └── resilience_test.rs  # Protocol resilience (loss, reorder, concurrent)
+│   ├── common/mod.rs           # Shared test helpers
+│   ├── echo_test.rs            # Basic echo tests
+│   ├── simple_test.rs          # Configuration and message tests
+│   └── resilience_test.rs      # Protocol resilience (loss, reorder, concurrent)
 └── benches/
-    └── kcp_bench.rs        # Criterion benchmarks
+    └── kcp_bench.rs            # Criterion benchmarks
 ```
 
 ---
@@ -36,17 +41,30 @@ kcp-tokio/
 ### Exports
 
 ```rust
-// Modules
-pub mod async_kcp;
-pub mod common;
+// Core protocol (re-exported from kcp-core)
+pub use kcp_core::protocol;
+pub use kcp_core;
+
+// Transport & runtime
+pub mod buffer_pool;
+pub mod transport;
+
+// Configuration & errors
 pub mod config;
 pub mod error;
+
+// Async KCP (flat layout)
+pub mod engine;      // Re-export from kcp-core
+pub(crate) mod actor;
+pub mod stream;
+pub mod listener;
 pub mod metrics;
 
 // Re-exports
 pub use config::KcpConfig;
 pub use error::{KcpError, Result};
-pub use async_kcp::*;
+pub use stream::KcpStream;
+pub use listener::KcpListener;
 pub use transport::{Transport, Addr, UdpTransport};
 
 // Constants
@@ -285,7 +303,7 @@ pub fn seq_after(seq1: SeqNum, seq2: SeqNum) -> bool;
 
 ---
 
-## `async_kcp/engine.rs` - Protocol Core
+## `kcp-core/src/engine.rs` - Protocol Core
 
 **Purpose:** KCP ARQ protocol implementation.
 
@@ -362,7 +380,7 @@ pub struct KcpEngine {
 
 ---
 
-## `async_kcp/stream.rs` - Stream API
+## `kcp/stream.rs` - Stream API
 
 **Purpose:** High-level async stream interface.
 
@@ -405,7 +423,7 @@ pub struct KcpStream {
 
 ---
 
-## `async_kcp/listener.rs` - Server Listener
+## `kcp/listener.rs` - Server Listener
 
 **Purpose:** Accept incoming KCP connections.
 

@@ -29,7 +29,7 @@ KCP-Rust is a high-performance async implementation of the KCP (Fast and Reliabl
 
 ## Core Components
 
-### 1. KcpEngine (`src/async_kcp/engine.rs`)
+### 1. KcpEngine (`kcp-core/src/engine.rs`)
 
 The protocol core implementing KCP ARQ logic:
 
@@ -73,7 +73,7 @@ pub struct KcpEngine {
 - Configurable congestion control
 - Fast retransmission support
 
-### 2. KcpStream (`src/async_kcp/stream.rs`)
+### 2. KcpStream (`kcp/stream.rs`)
 
 High-level async stream providing TCP-like interface. Each stream spawns a dedicated
 actor task that owns the `KcpEngine` exclusively — no `Arc<Mutex<>>` needed.
@@ -85,7 +85,7 @@ Communication between the stream handle and actor uses mpsc channels (`EngineCmd
 - Native `send()` / `recv()` methods
 - Actor-based background task (update + I/O in one loop)
 
-### 3. KcpListener (`src/async_kcp/listener.rs`)
+### 3. KcpListener (`kcp/listener.rs`)
 
 Server-side connection acceptor:
 
@@ -94,7 +94,7 @@ Server-side connection acceptor:
 - Routes packets to appropriate streams using `DashMap` (lock-free concurrent hashmap)
 - Packet routing hot path requires no async lock acquisition
 
-### 4. KcpConfig (`src/config.rs`)
+### 4. KcpConfig (`kcp/config.rs`)
 
 Builder pattern configuration:
 
@@ -236,7 +236,7 @@ updates in a single `tokio::select!` loop — no mutex contention.
 
 ## Error Handling
 
-Error types in `src/error.rs`:
+Error types in `kcp/error.rs`:
 
 ```rust
 pub enum KcpError {
@@ -251,7 +251,7 @@ pub enum KcpError {
 
 ## Transport Layer
 
-The `Transport` trait (`src/transport.rs`) abstracts the datagram transport, allowing
+The `Transport` trait (`kcp/transport.rs`) abstracts the datagram transport, allowing
 KCP to run over any async datagram transport, not just UDP.
 
 ```rust

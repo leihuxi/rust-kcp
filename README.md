@@ -23,7 +23,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.3.7"
+kcp-tokio = "0.4"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -32,7 +32,7 @@ tokio = { version = "1.0", features = ["full"] }
 ### Client
 
 ```rust
-use kcp_tokio::{KcpConfig, async_kcp::KcpStream};
+use kcp_tokio::{KcpConfig, KcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### Server
 
 ```rust
-use kcp_tokio::{KcpConfig, async_kcp::KcpListener};
+use kcp_tokio::{KcpConfig, KcpListener};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
@@ -254,8 +254,8 @@ cargo bench
 
 ## Version History
 
-- **v0.3.7** (next): Fix ACK window/UNA fields (critical flow control bug), generic Transport trait with RPITIT, resilience tests, criterion benchmarks, VecDeque pre-allocation, retransmission stats tracking
-- **v0.3.7**: Actor-based lock-free architecture, DashMap packet routing, BTreeMap receive buffer, zero-copy segment encoding, timestamp caching
+- **v0.4.0**: Extract kcp-core as standalone protocol crate, restructure source layout (src/ → kcp/, flatten async_kcp/)
+- **v0.3.7**: Fix ACK window/UNA fields, generic Transport trait with RPITIT, resilience tests, criterion benchmarks
 - **v0.3.4**: Engine refactoring, lock-free buffer pools, documentation
 - **v0.3.3**: Performance optimizations, sub-millisecond latency
 - **v0.3.1**: Full async support, comprehensive configuration

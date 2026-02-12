@@ -36,35 +36,38 @@
 
 ```
 kcp-rust/
-├── src/
-│   ├── lib.rs           # Crate root
-│   ├── config.rs        # Configuration
-│   ├── error.rs         # Error types
-│   ├── common.rs        # Shared types
-│   ├── transport.rs     # Generic Transport trait + UdpTransport
-│   ├── metrics.rs       # Monitoring
-│   └── async_kcp/
-│       ├── actor.rs     # Actor task (owns KcpEngine)
-│       ├── engine.rs    # Protocol core
-│       ├── stream.rs    # Stream API
-│       └── listener.rs  # Server listener
-├── examples/
-│   ├── simple_echo.rs
-│   ├── perf_test_server.rs
-│   └── perf_test_client.rs
+├── kcp-core/                # Standalone sync protocol engine
+│   └── src/
+│       ├── lib.rs
+│       ├── protocol.rs      # Wire types & constants
+│       ├── config.rs        # KcpCoreConfig, NodeDelayConfig
+│       ├── error.rs         # KcpCoreError (3 variants)
+│       └── engine.rs        # KcpEngine (pure sync)
+├── kcp/                     # Async runtime layer (kcp-tokio)
+│   ├── lib.rs               # Crate root
+│   ├── engine.rs            # Re-export from kcp-core
+│   ├── actor.rs             # Actor task (owns KcpEngine)
+│   ├── stream.rs            # KcpStream (AsyncRead/AsyncWrite)
+│   ├── listener.rs          # KcpListener (connection acceptor)
+│   ├── config.rs            # KcpConfig (extends KcpCoreConfig)
+│   ├── error.rs             # KcpError (extends KcpCoreError)
+│   ├── transport.rs         # Generic Transport trait + UdpTransport
+│   ├── buffer_pool.rs       # Lock-free buffer pool
+│   ├── common.rs            # Internal re-exports
+│   └── metrics.rs           # Performance monitoring
 ├── tests/
+│   ├── common/mod.rs        # Shared test helpers
 │   ├── echo_test.rs         # Basic echo tests
-│   ├── integration_test.rs  # Comprehensive integration
-│   ├── resilience_test.rs   # Protocol resilience (loss, reorder, concurrent)
-│   └── ...
+│   ├── simple_test.rs       # Configuration and message tests
+│   └── resilience_test.rs   # Protocol resilience (loss, reorder, concurrent)
 ├── benches/
-│   └── kcp_bench.rs     # Criterion benchmarks
+│   └── kcp_bench.rs         # Criterion benchmarks
+├── examples/
 └── doc/
-    └── *.md             # Documentation
 ```
 
 ## Version
 
-- Library Version: 0.3.7
+- Library Version: 0.4.0
 - Protocol Version: 1
 - Rust Edition: 2021
