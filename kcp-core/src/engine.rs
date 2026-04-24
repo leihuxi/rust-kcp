@@ -144,6 +144,19 @@ impl KcpEngine {
         Ok(())
     }
 
+    /// Current conversation ID.
+    pub fn conv(&self) -> ConvId {
+        self.conv
+    }
+
+    /// Override the conversation ID. Used by the server-side handshake where
+    /// the listener allocates a new non-zero `conv` after a client connects
+    /// with `conv=0` (the tokio_kcp handshake convention). All subsequent
+    /// outgoing segments will carry the new `conv`.
+    pub fn set_conv(&mut self, conv: ConvId) {
+        self.conv = conv;
+    }
+
     /// Drain buffered output packets. The caller is responsible for sending
     /// each `Bytes` over the transport.
     pub fn drain_output(&mut self) -> Vec<Bytes> {

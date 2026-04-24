@@ -42,6 +42,8 @@ tokio-test = "0.4"
 rand = "0.8"
 criterion = "0.5"
 tracing-subscriber = "0.3"
+tokio_kcp = "0.9"
+env_logger = "0.11"
 
 
 [[example]]
@@ -51,6 +53,14 @@ path = "examples/simple_echo.rs"
 [[example]]
 name = "interop_client_simple"
 path = "examples/interop_client_simple.rs"
+
+[[example]]
+name = "issue5_repro"
+path = "examples/issue5_repro.rs"
+
+[[example]]
+name = "issue5_tokio_kcp_client"
+path = "examples/issue5_tokio_kcp_client.rs"
 
 [[example]]
 name = "perf_test_server"

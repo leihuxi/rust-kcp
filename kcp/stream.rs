@@ -123,19 +123,30 @@ impl<T: Transport> KcpStream<T> {
         Ok(stream)
     }
 
-    /// Create a new server-side KCP stream (with proper routing)
+    /// Create a new server-side KCP stream (with proper routing).
+    ///
+    /// `client_conv` is the `conv` seen on the wire in the first packet; the
+    /// engine is constructed with it so `input()` can parse that packet.
+    /// `server_conv` is the conv the server will use for outgoing segments —
+    /// when the two differ (client sent `conv=0`), this performs the tokio_kcp
+    /// handshake by switching the engine's conv before the first flush.
     pub async fn new_server_stream(
         transport: Arc<T>,
         peer_addr: T::Addr,
-        conv: ConvId,
+        client_conv: ConvId,
+        server_conv: ConvId,
         config: KcpConfig,
         initial_packet: Bytes,
     ) -> Result<Self> {
-        let mut engine = KcpEngine::new(conv, config.clone());
+        let mut engine = KcpEngine::new(client_conv, config.clone());
         engine.start()?;
 
-        // Process the initial packet synchronously
+        // Process the initial packet under the client's conv (may be 0), then
+        // switch to the server-assigned non-zero conv for all outgoing traffic.
         engine.input(initial_packet)?;
+        if client_conv != server_conv {
+            engine.set_conv(server_conv);
+        }
         engine.update()?;
         engine.flush()?;
 
@@ -176,7 +187,12 @@ impl<T: Transport> KcpStream<T> {
             closed: false,
         };
 
-        info!(peer = %stream.peer_addr, conv = conv, "KCP server stream established");
+        info!(
+            peer = %stream.peer_addr,
+            client_conv,
+            server_conv,
+            "KCP server stream established"
+        );
         Ok(stream)
     }
 

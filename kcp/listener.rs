@@ -24,7 +24,13 @@ struct StreamHandle {
 #[derive(Debug, Clone)]
 pub struct IncomingConnection<A: Addr> {
     pub peer_addr: A,
+    /// Conv the server uses for outgoing traffic. Always non-zero. If the
+    /// client opened the connection with `conv == 0` (tokio_kcp handshake
+    /// convention), the listener allocates a fresh random conv here.
     pub conv: ConvId,
+    /// Conv observed on the wire in the first packet. Needed so the engine
+    /// can parse that initial packet before we switch to the server-side conv.
+    client_conv: ConvId,
     pub handshake_data: Bytes,
     created_at: Instant,
 }
@@ -271,15 +277,28 @@ impl<T: Transport> KcpListener<T> {
 
                 drop(state);
 
+                // tokio_kcp handshake: a client that calls connect_with_conv(_, 0, _)
+                // expects the server to reply with a new non-zero conv, which lets
+                // the client's Kcp::input() clear its `waiting_conv` flag. If we echo
+                // back conv=0 verbatim, the client refuses to send any further data.
+                let client_conv = header.conv;
+                let server_conv = if client_conv == 0 {
+                    crate::common::random_conv_id()
+                } else {
+                    client_conv
+                };
+
                 debug!(
                     peer = %peer_addr,
-                    conv = header.conv,
+                    client_conv,
+                    server_conv,
                     "First KCP packet from new peer"
                 );
 
                 let incoming = IncomingConnection {
                     peer_addr: peer_addr.clone(),
-                    conv: header.conv,
+                    conv: server_conv,
+                    client_conv,
                     handshake_data: data.clone(),
                     created_at: Instant::now(),
                 };
@@ -295,7 +314,8 @@ impl<T: Transport> KcpListener<T> {
                 } else {
                     debug!(
                         peer = %peer_addr,
-                        conv = header.conv,
+                        client_conv,
+                        server_conv,
                         "New KCP connection queued for accept"
                     );
                 }
@@ -314,6 +334,7 @@ impl<T: Transport> KcpListener<T> {
         let stream = KcpStream::new_server_stream(
             self.transport.clone(),
             peer_addr.clone(),
+            incoming.client_conv,
             incoming.conv,
             self.config.clone(),
             incoming.handshake_data,
