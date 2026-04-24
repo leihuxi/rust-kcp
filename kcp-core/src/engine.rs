@@ -77,6 +77,9 @@ pub struct KcpEngine {
 
     // Output queue (replaces OutputFn)
     output_queue: Vec<Bytes>,
+    // Segments pending emission — packed up to `mtu` per UDP datagram,
+    // matching the canonical skywind3000 KCP behaviour.
+    out_buf: BytesMut,
 
     // State
     stats: KcpStats,
@@ -127,6 +130,7 @@ impl KcpEngine {
             ack_list: Vec::with_capacity(config.rcv_wnd as usize),
 
             output_queue: Vec::with_capacity(config.snd_wnd as usize),
+            out_buf: BytesMut::with_capacity(config.mtu as usize),
 
             stats: KcpStats::default(),
             last_update: current_timestamp(),
@@ -309,6 +313,7 @@ impl KcpEngine {
         let mut buf = data;
         let mut flag = false;
         let mut max_ack = 0;
+        let mut latest_ts: Timestamp = 0;
 
         // Process all segments in the packet
         while buf.len() >= KcpHeader::SIZE {
@@ -355,11 +360,18 @@ impl KcpEngine {
 
                     self.parse_ack(segment.header.sn);
 
+                    // Track the sn of the newest ACK *by timestamp* so fast-
+                    // resend counters only react to freshly acknowledged
+                    // segments, not reordered duplicates.
                     if !flag {
                         flag = true;
                         max_ack = segment.header.sn;
-                    } else if seq_after(segment.header.sn, max_ack) {
+                        latest_ts = segment.header.ts;
+                    } else if seq_after(segment.header.sn, max_ack)
+                        && time_diff(segment.header.ts, latest_ts) > 0
+                    {
                         max_ack = segment.header.sn;
+                        latest_ts = segment.header.ts;
                     }
                 }
 
@@ -399,7 +411,7 @@ impl KcpEngine {
 
         // Process fast ACK
         if flag {
-            self.parse_fastack(max_ack);
+            self.parse_fastack(max_ack, latest_ts);
         }
 
         // Update congestion window
@@ -431,6 +443,9 @@ impl KcpEngine {
 
         // Flush data segments
         self.flush_data_segments(current)?;
+
+        // Push any remaining packed segments out as a final UDP datagram.
+        self.flush_out_buf();
 
         // Update congestion control
         self.update_congestion_control();
@@ -524,16 +539,20 @@ impl KcpEngine {
         }
     }
 
-    fn parse_fastack(&mut self, sn: SeqNum) {
+    fn parse_fastack(&mut self, sn: SeqNum, ts: Timestamp) {
         if seq_before(sn, self.snd_una) || !seq_before(sn, self.snd_nxt) {
             return;
         }
 
         for segment in &mut self.snd_buf {
-            if seq_before(segment.header.sn, sn) {
-                segment.fastack += 1;
-            } else if segment.header.sn != sn {
+            if !seq_before(segment.header.sn, sn) {
                 break;
+            }
+            // Only count fastack for segments whose own ts is older than the
+            // acking segment's ts — avoids inflating fastack from reordered
+            // ACKs for already-resent segments.
+            if time_diff(ts, segment.header.ts) >= 0 {
+                segment.fastack += 1;
             }
         }
     }
@@ -586,7 +605,10 @@ impl KcpEngine {
             }
         }
 
-        let rto = self.rtt.avg + 4 * self.rtt.var.max(self.config.nodelay.interval);
+        // Canonical skywind3000 KCP: rto = srtt + max(interval, 4 * rttvar).
+        // The previous `avg + 4 * max(var, interval)` inflated RTO by ~4x when
+        // interval > var (common under normal-mode defaults), slowing recovery.
+        let rto = self.rtt.avg + self.config.nodelay.interval.max(4 * self.rtt.var);
         self.rtt.rto = rto.clamp(self.rtt.min_rto, constants::IKCP_RTO_MAX);
 
         self.stats.rtt = self.rtt.avg;
@@ -704,12 +726,10 @@ impl KcpEngine {
             self.mark_segments_for_send(current, resend, rtomin);
 
         for i in send_indices {
-            let segment = &self.snd_buf[i];
-            let is_dead = segment.xmit >= self.dead_link;
-            let mut buf = BytesMut::with_capacity(segment.size());
-            segment.encode(&mut buf);
-            self.output_queue.push(buf.freeze());
-            self.stats.packets_sent += 1;
+            let is_dead = self.snd_buf[i].xmit >= self.dead_link;
+            // Clone is O(1) — `Bytes` is a refcounted view over the payload.
+            let segment = self.snd_buf[i].clone();
+            self.output_segment(segment)?;
 
             if is_dead {
                 return Err(KcpCoreError::connection_lost());
@@ -841,12 +861,28 @@ impl KcpEngine {
         self.stats.rcv_buf_size = self.rcv_buf.len() as u32;
     }
 
+    /// Append a segment to the pending output buffer, flushing the buffer to
+    /// the output queue first if the new segment would overflow one MTU.
+    /// Multiple segments share a single UDP datagram up to `mtu` bytes.
     fn output_segment(&mut self, segment: KcpSegment) -> KcpCoreResult<()> {
-        let mut buf = BytesMut::with_capacity(segment.size());
-        segment.encode(&mut buf);
-        self.output_queue.push(buf.freeze());
+        let need = segment.size();
+        if self.out_buf.len() + need > self.config.mtu as usize && !self.out_buf.is_empty() {
+            self.output_queue.push(std::mem::take(&mut self.out_buf).freeze());
+            self.out_buf = BytesMut::with_capacity(self.config.mtu as usize);
+        }
+        segment.encode(&mut self.out_buf);
         self.stats.packets_sent += 1;
         Ok(())
+    }
+
+    /// Flush any bytes sitting in `out_buf` to the output queue. Must be
+    /// called at the end of every `flush()` pass so buffered segments actually
+    /// leave the engine.
+    fn flush_out_buf(&mut self) {
+        if !self.out_buf.is_empty() {
+            self.output_queue.push(std::mem::take(&mut self.out_buf).freeze());
+            self.out_buf = BytesMut::with_capacity(self.config.mtu as usize);
+        }
     }
 
     fn wnd_unused(&self) -> u32 {
