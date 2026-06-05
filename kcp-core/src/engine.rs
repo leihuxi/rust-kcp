@@ -86,7 +86,6 @@ pub struct KcpEngine {
     last_update: Timestamp,
     last_activity: Timestamp,
     dead_link: u32,
-    xmit_count: u32,
 }
 
 impl KcpEngine {
@@ -116,6 +115,12 @@ impl KcpEngine {
                 snd: config.snd_wnd,
                 rcv: config.rcv_wnd,
                 rmt: constants::IKCP_WND_RCV,
+                // Start at the full send window rather than canonical KCP's
+                // slow-start `cwnd = 0`. KCP deliberately trades bandwidth for
+                // latency, so an initial burst up to `snd_wnd` matches this
+                // library's low-latency goal; the real fix is that `update_cwnd`
+                // now only *grows* cwnd when an ACK advances snd_una, and a loss
+                // still drops it into proper congestion avoidance.
                 cwnd: config.snd_wnd,
                 ssthresh: constants::IKCP_THRESH_INIT,
                 incr: 0,
@@ -136,7 +141,6 @@ impl KcpEngine {
             last_update: current_timestamp(),
             last_activity: current_timestamp(),
             dead_link: config.max_retries,
-            xmit_count: 0,
 
             config,
         }
@@ -310,6 +314,10 @@ impl KcpEngine {
         }
 
         let original_size = data.len();
+        // Snapshot snd_una before processing so we can tell whether any ACK in
+        // this packet advanced it — the condition canonical KCP uses to gate
+        // congestion-window growth.
+        let prev_una = self.snd_una;
         let mut buf = data;
         let mut flag = false;
         let mut max_ack = 0;
@@ -352,10 +360,10 @@ impl KcpEngine {
 
             match segment.header.cmd {
                 constants::IKCP_CMD_ACK => {
-                    // Process ACK
-                    if current >= segment.header.ts {
-                        let rtt = current - segment.header.ts;
-                        self.update_ack(rtt as i32);
+                    // Process ACK. Use wrapping time_diff (not a raw `>=`) so the
+                    // RTT sample survives the u32 millisecond clock wrapping.
+                    if time_diff(current, segment.header.ts) >= 0 {
+                        self.update_ack(time_diff(current, segment.header.ts));
                     }
 
                     self.parse_ack(segment.header.sn);
@@ -414,8 +422,8 @@ impl KcpEngine {
             self.parse_fastack(max_ack, latest_ts);
         }
 
-        // Update congestion window
-        self.update_cwnd();
+        // Update congestion window — only grows if this packet's ACKs advanced snd_una.
+        self.update_cwnd(prev_una);
 
         self.stats.packets_received += 1;
 
@@ -453,6 +461,40 @@ impl KcpEngine {
         Ok(())
     }
 
+    /// Milliseconds until the engine next needs a [`flush`](Self::flush).
+    ///
+    /// Lets the async driver sleep until the next real deadline instead of
+    /// polling every fixed interval — for many idle connections that is the
+    /// difference between N wakeups per interval and almost none. Returns:
+    /// - `0` if there is an ACK or window probe to send right now;
+    /// - otherwise the soonest retransmit deadline in `snd_buf`, and the window
+    ///   probe deadline when the remote window is closed;
+    /// - a large idle value when nothing is scheduled (the caller still caps the
+    ///   wait by its own keep-alive period).
+    pub fn check(&self) -> u32 {
+        let current = current_timestamp();
+
+        if !self.ack_list.is_empty() || self.probe.flags != 0 {
+            return 0;
+        }
+
+        let mut next = u32::MAX;
+        for seg in &self.snd_buf {
+            let d = time_diff(seg.resendts, current).max(0) as u32;
+            next = next.min(d);
+        }
+        if self.wnd.rmt == 0 && self.probe.ts != 0 {
+            let d = time_diff(self.probe.ts, current).max(0) as u32;
+            next = next.min(d);
+        }
+
+        if next == u32::MAX {
+            30_000 // fully idle; caller caps by keep-alive
+        } else {
+            next
+        }
+    }
+
     /// Update KCP state (called periodically)
     pub fn update(&mut self) -> KcpCoreResult<()> {
         let current = current_timestamp();
@@ -475,9 +517,31 @@ impl KcpEngine {
         &self.stats
     }
 
-    /// Check if connection is alive
+    /// Check if connection is alive.
+    ///
+    /// A connection is considered dead when any in-flight segment has been
+    /// retransmitted `dead_link` times without acknowledgement — the same
+    /// per-segment criterion that makes `flush` raise `ConnectionLost`. (The
+    /// previous implementation used a cumulative retransmission counter that
+    /// never reset, so any long-lived connection eventually reported dead.)
     pub fn is_dead(&self) -> bool {
-        self.xmit_count >= self.dead_link
+        self.snd_buf.iter().any(|seg| seg.xmit >= self.dead_link)
+    }
+
+    /// Number of application messages queued for sending but not yet moved into
+    /// the in-flight send buffer. Used by the async layer to apply write
+    /// backpressure — `snd_queue` is otherwise unbounded and a fast writer over
+    /// a slow link would grow it without limit (OOM).
+    pub fn send_queue_len(&self) -> usize {
+        self.snd_queue.len()
+    }
+
+    /// True while any outbound data is still queued (`snd_queue`) or sent but
+    /// unacknowledged (`snd_buf`). The async layer uses this on graceful close
+    /// to keep flushing/retransmitting until the peer has acknowledged
+    /// everything, so the tail of a stream isn't dropped when the window is full.
+    pub fn has_unsent_data(&self) -> bool {
+        !self.snd_queue.is_empty() || !self.snd_buf.is_empty()
     }
 
     /// Milliseconds since last send or receive activity
@@ -504,7 +568,9 @@ impl KcpEngine {
             return seg.data.len() as i32;
         }
 
-        if self.rcv_queue.len() < (seg.header.frg + 1) as usize {
+        // `frg` is attacker-controlled wire data; add in usize so `frg == 255`
+        // can't overflow the u8 (which panicked in debug, wrapped to 0 in release).
+        if self.rcv_queue.len() < seg.header.frg as usize + 1 {
             return -1;
         }
 
@@ -587,6 +653,10 @@ impl KcpEngine {
     }
 
     fn update_ack(&mut self, rtt: i32) {
+        // Clamp the sample: a peer can echo a bogus `ts`, yielding a huge rtt
+        // that would overflow the `7 * avg + rtt` smoothing below. Bound it to
+        // a sane maximum (and never below 0) before it touches the estimators.
+        let rtt = rtt.clamp(0, constants::IKCP_RTO_MAX as i32);
         if self.rtt.avg == 0 {
             self.rtt.avg = rtt as u32;
             self.rtt.var = rtt as u32 / 2;
@@ -766,7 +836,6 @@ impl KcpEngine {
             } else if time_diff(current, segment.resendts) >= 0 {
                 needsend = true;
                 segment.xmit += 1;
-                self.xmit_count += 1;
                 self.stats.retransmissions += 1;
 
                 if self.config.nodelay.nodelay {
@@ -827,8 +896,8 @@ impl KcpEngine {
         }
     }
 
-    fn update_cwnd(&mut self) {
-        if time_diff(self.snd_una, self.wnd.cwnd) > 0 && self.wnd.cwnd < self.wnd.rmt {
+    fn update_cwnd(&mut self, prev_una: SeqNum) {
+        if seq_after(self.snd_una, prev_una) && self.wnd.cwnd < self.wnd.rmt {
             let mss = self.mss();
             if self.wnd.cwnd < self.wnd.ssthresh {
                 self.wnd.cwnd += 1;

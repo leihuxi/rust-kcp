@@ -79,6 +79,33 @@ fn test_large_message() {
 }
 
 #[test]
+fn test_malformed_frg_does_not_panic() {
+    // A peer-controlled PUSH segment with frg = 255 must not overflow when
+    // peek_size() computes (frg + 1). Regression for a u8 add-overflow that
+    // panicked in debug builds and wrapped to 0 in release.
+    let config = KcpCoreConfig::default();
+    let mut server = KcpEngine::new(1, config);
+    server.start().unwrap();
+
+    let mut pkt = Vec::with_capacity(25);
+    pkt.extend_from_slice(&1u32.to_le_bytes()); // conv = 1
+    pkt.push(81); // cmd = IKCP_CMD_PUSH
+    pkt.push(255); // frg = 255 (malicious)
+    pkt.extend_from_slice(&128u16.to_le_bytes()); // wnd
+    pkt.extend_from_slice(&0u32.to_le_bytes()); // ts
+    pkt.extend_from_slice(&0u32.to_le_bytes()); // sn = 0 (== rcv_nxt)
+    pkt.extend_from_slice(&0u32.to_le_bytes()); // una
+    pkt.extend_from_slice(&1u32.to_le_bytes()); // len = 1
+    pkt.push(0x42); // 1 data byte
+
+    server.input(Bytes::from(pkt)).unwrap();
+
+    // Must not panic; the fragment claims frg=255 so the message is incomplete.
+    let msg = server.recv().unwrap();
+    assert!(msg.is_none());
+}
+
+#[test]
 fn test_conv_mismatch() {
     let config = KcpCoreConfig::default();
     let mut client = KcpEngine::new(100, config.clone());

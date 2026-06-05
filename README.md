@@ -12,9 +12,16 @@ A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Pr
 - **Zero-Copy**: Efficient buffer management using the `bytes` crate
 - **Lock-Free Buffer Pool**: High-performance memory management with `crossbeam`
 - **Connection-Oriented**: High-level connection abstractions (`KcpStream`, `KcpListener`)
-- **Protocol Compatible**: Compatible with original C KCP implementation
+- **Backpressure Both Ways**: Bounded send/receive paths — a fast writer over a
+  slow link blocks instead of growing memory without bound; received data is
+  never dropped after being acknowledged
+- **Graceful Close**: Drains and acknowledges in-flight data before shutdown so
+  the tail of a stream isn't lost
+- **Event-Driven Scheduling**: Sleeps until the next real protocol deadline
+  instead of polling every interval — idle connections cost almost nothing
+- **Monotonic Clock**: RTT/RTO immune to wall-clock (NTP) jumps
+- **Protocol Compatible**: Interoperable with the original C KCP and `tokio_kcp`
 - **Observability**: Integrated tracing and metrics support
-- **Memory Efficient**: Object pooling and buffer reuse
 - **Multiple Performance Modes**: Normal, Fast, Turbo, Gaming presets
 
 ## Installation

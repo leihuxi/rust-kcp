@@ -18,13 +18,34 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
 use tracing::{info, trace};
 
+/// Capacity of the bounded outbound-data channel between the stream and its
+/// actor. Small on purpose — the real send buffer lives in the engine, bounded
+/// by [`send_high_water`]; this just hands data across without itself becoming
+/// an unbounded queue.
+const SEND_CHANNEL_CAPACITY: usize = 16;
+
+/// High-water mark (in queued messages) at which the actor stops accepting new
+/// writes, applying backpressure. Scaled off the send window so a writer can
+/// stay a few windows ahead of the network without growing the queue forever.
+fn send_high_water(config: &KcpConfig) -> usize {
+    (config.snd_wnd as usize * 4).max(64)
+}
+
 /// High-level async KCP stream providing TCP-like interface over UDP
 pub struct KcpStream<T: Transport = UdpTransport> {
     handle: EngineHandle,
+    /// Bounded channel carrying outbound application data to the actor. Its
+    /// capacity is the write backpressure: a full channel blocks `send` /
+    /// `poll_write` instead of growing the engine's send queue without bound.
+    send_tx: mpsc::Sender<Bytes>,
     pub(crate) input_tx: mpsc::Sender<Bytes>,
     data_rx: mpsc::Receiver<Bytes>,
     transport: Arc<T>,
     peer_addr: T::Addr,
+    /// Max segment size (mtu − header). `poll_write` chunks the byte stream to
+    /// this so no single KCP message exceeds the engine's fragment limit; also
+    /// the size ceiling enforced by the message-oriented [`send`](Self::send).
+    mss: usize,
 
     // Read/write state
     read_buf: BytesMut,
@@ -81,24 +102,31 @@ impl<T: Transport> KcpStream<T> {
         engine.start()?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (send_tx, send_rx) = mpsc::channel(SEND_CHANNEL_CAPACITY);
         let (input_tx, input_rx) = mpsc::channel(256);
         let (data_tx, data_rx) = mpsc::channel(256);
         let handle = EngineHandle::new(cmd_tx);
 
         let update_interval = config.nodelay.interval as u64;
         let keep_alive_ms = config.keep_alive.map(|d| d.as_millis() as u64);
+        let simulate_loss = config.simulate_packet_loss;
+        let send_high_water = send_high_water(&config);
+        let mss = config.mtu.saturating_sub(constants::IKCP_OVERHEAD).max(1) as usize;
 
         let transport_actor = transport.clone();
         let actor_peer = peer_addr.clone();
         let actor_task = tokio::spawn(run_engine_actor(
             engine,
             cmd_rx,
+            send_rx,
             input_rx,
             data_tx,
             transport_actor,
             actor_peer,
             update_interval,
             keep_alive_ms,
+            simulate_loss,
+            send_high_water,
         ));
 
         // Client: spawn recv_task that reads from transport → input_tx
@@ -106,10 +134,12 @@ impl<T: Transport> KcpStream<T> {
 
         let stream = Self {
             handle,
+            send_tx,
             input_tx,
             data_rx,
             transport,
             peer_addr,
+            mss,
             read_buf: crate::common::try_get_buffer(2048),
             pending_write: None,
             pending_flush: None,
@@ -151,33 +181,42 @@ impl<T: Transport> KcpStream<T> {
         engine.flush()?;
 
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (send_tx, send_rx) = mpsc::channel(SEND_CHANNEL_CAPACITY);
         let (input_tx, input_rx) = mpsc::channel(256);
         let (data_tx, data_rx) = mpsc::channel(256);
         let handle = EngineHandle::new(cmd_tx);
 
         let update_interval = config.nodelay.interval as u64;
         let keep_alive_ms = config.keep_alive.map(|d| d.as_millis() as u64);
+        let simulate_loss = config.simulate_packet_loss;
+        let send_high_water = send_high_water(&config);
+        let mss = config.mtu.saturating_sub(constants::IKCP_OVERHEAD).max(1) as usize;
 
         let transport_actor = transport.clone();
         let actor_peer = peer_addr.clone();
         let actor_task = tokio::spawn(run_engine_actor(
             engine,
             cmd_rx,
+            send_rx,
             input_rx,
             data_tx,
             transport_actor,
             actor_peer,
             update_interval,
             keep_alive_ms,
+            simulate_loss,
+            send_high_water,
         ));
 
         // Server streams don't have a recv_task — packets are routed by the listener
         let stream = Self {
             handle,
+            send_tx,
             input_tx,
             data_rx,
             transport,
             peer_addr,
+            mss,
             read_buf: crate::common::try_get_buffer(2048),
             pending_write: None,
             pending_flush: None,
@@ -216,12 +255,29 @@ impl<T: Transport> KcpStream<T> {
         self.input_tx.clone()
     }
 
-    /// Send data through the KCP stream
+    /// Send data through the KCP stream.
+    ///
+    /// Awaits if the bounded send channel is full (backpressure) and returns a
+    /// closed error if the actor has exited.
     pub async fn send(&self, data: &[u8]) -> Result<()> {
         if self.closed {
             return Err(KcpError::connection(ConnectionError::Closed));
         }
-        self.handle.send(Bytes::copy_from_slice(data)).await
+        // The engine rejects a single message that needs IKCP_WND_RCV or more
+        // fragments; fail fast with a clear error rather than letting it be
+        // silently dropped in the actor.
+        let max_msg = self.mss * (constants::IKCP_WND_RCV as usize - 1);
+        if data.len() > max_msg {
+            return Err(KcpError::buffer(format!(
+                "message of {} bytes exceeds max {} for one send; use AsyncWrite for streaming",
+                data.len(),
+                max_msg
+            )));
+        }
+        self.send_tx
+            .send(Bytes::copy_from_slice(data))
+            .await
+            .map_err(|_| KcpError::connection(ConnectionError::Closed))
     }
 
     /// Receive data from the KCP stream
@@ -262,9 +318,10 @@ impl<T: Transport> KcpStream<T> {
         // Signal actor to flush and stop
         self.handle.close();
 
-        // Wait briefly for the actor to finish flushing
+        // Wait for the actor to finish its graceful drain (it breaks as soon as
+        // the peer has acknowledged everything; this is just an upper bound).
         if let Some(task) = self.actor_task.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), task).await;
         }
 
         self.abort_tasks();
@@ -393,13 +450,18 @@ impl<T: Transport> AsyncWrite for KcpStream<T> {
             )));
         }
 
-        // Reuse pending future if it exists (don't recreate on every poll)
+        // Reuse pending future if it exists (don't recreate on every poll).
+        // The future awaits the bounded send channel, so a full channel parks
+        // the writer (backpressure) instead of overflowing the engine. The write
+        // is chunked to one MSS so each KCP message is a single segment — the
+        // byte-stream has no message boundaries to preserve, and this keeps any
+        // one message well under the engine's fragment limit.
         if self.pending_write.is_none() {
-            let handle = self.handle.clone();
-            let data = Bytes::copy_from_slice(buf);
-            let len = buf.len();
+            let send_tx = self.send_tx.clone();
+            let len = buf.len().min(self.mss);
+            let data = Bytes::copy_from_slice(&buf[..len]);
             self.pending_write = Some(Box::pin(async move {
-                handle.send(data).await.map_err(io::Error::other)?;
+                send_tx.send(data).await.map_err(io::Error::other)?;
                 Ok(len)
             }));
         }

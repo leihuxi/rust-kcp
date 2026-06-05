@@ -122,7 +122,7 @@ impl KcpError {
                     | std::io::ErrorKind::Interrupted
             ),
             Self::Timeout { .. } | Self::Buffer { .. } => true,
-            Self::Connection { kind } => matches!(kind, ConnectionError::Lost),
+            // A lost connection is terminal (see `is_fatal`), not recoverable.
             _ => false,
         }
     }

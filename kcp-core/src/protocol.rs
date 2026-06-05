@@ -1,7 +1,6 @@
 //! KCP protocol types, constants, and utilities
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// KCP protocol constants
 pub mod constants {
@@ -249,12 +248,21 @@ pub struct KcpStats {
     pub rcv_buf_size: u32,
 }
 
-/// Get current timestamp in milliseconds
+/// Get the current KCP timestamp in milliseconds.
+///
+/// Backed by a process-wide **monotonic** clock (`Instant`), not the wall
+/// clock. KCP only ever takes *differences* of these timestamps (see
+/// [`time_diff`]) for RTT/RTO and retransmit scheduling, so an absolute epoch
+/// is meaningless — but wall-clock jumps (NTP steps, manual clock changes)
+/// would corrupt those differences, spiking RTO or discarding RTT samples
+/// mid-connection. A monotonic source is immune to that. The `u32` wraps every
+/// ~49.7 days, which `time_diff`'s wrapping arithmetic already handles.
 pub fn current_timestamp() -> Timestamp {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as Timestamp
+    use std::sync::OnceLock;
+    use std::time::Instant;
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    let base = *BASE.get_or_init(Instant::now);
+    base.elapsed().as_millis() as Timestamp
 }
 
 /// Calculate time difference handling wrapping

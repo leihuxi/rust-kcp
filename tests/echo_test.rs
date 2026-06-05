@@ -68,6 +68,65 @@ async fn test_echo_server_client() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_large_transfer_backpressure() {
+    // Stream far more data than any single window through small windows so the
+    // send path must apply backpressure many times over. Verifies the bounded
+    // send queue neither drops nor reorders bytes — i.e. backpressure preserves
+    // reliability under a fast writer over a slow link.
+    const TOTAL: usize = 256 * 1024;
+
+    let (addr_tx, addr_rx) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let config = KcpConfig::new().fast_mode().window_size(16, 16).mtu(1200);
+        let mut listener = KcpListener::bind("127.0.0.1:0".parse().unwrap(), config)
+            .await
+            .unwrap();
+        addr_tx.send(*listener.local_addr()).unwrap();
+        let (mut stream, _) = listener.accept().await.unwrap();
+
+        let mut buf = vec![0u8; 65536];
+        let mut echoed = 0usize;
+        while echoed < TOTAL {
+            let n = stream.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            stream.write_all(&buf[..n]).await.unwrap();
+            echoed += n;
+        }
+        stream.flush().await.unwrap();
+        let _ = stream.close().await;
+        let _ = listener.close().await;
+    });
+
+    let addr = addr_rx.await.unwrap();
+    let client_config = KcpConfig::new().fast_mode().window_size(16, 16).mtu(1200);
+    let client = KcpStream::connect(addr, client_config).await.unwrap();
+
+    let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+    let payload_w = payload.clone();
+
+    // Split so the client can write and read its echo concurrently — a lockstep
+    // writer would never trigger sustained backpressure.
+    let (mut rd, mut wr) = tokio::io::split(client);
+    let writer = tokio::spawn(async move {
+        wr.write_all(&payload_w).await.unwrap();
+        wr.flush().await.unwrap();
+    });
+
+    let mut got = vec![0u8; TOTAL];
+    timeout(Duration::from_secs(30), rd.read_exact(&mut got))
+        .await
+        .expect("timeout receiving echo under backpressure")
+        .expect("read_exact failed");
+
+    writer.await.unwrap();
+    assert_eq!(got, payload, "echoed data mismatch under backpressure");
+
+    let _ = timeout(Duration::from_secs(2), server).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_multiple_messages() {
     let server_config = KcpConfig::realtime();
     let (server_addr, server_handle) = spawn_echo_server(server_config, 3).await;

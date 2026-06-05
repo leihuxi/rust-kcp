@@ -158,6 +158,11 @@ impl KcpConfig {
         if self.snd_wnd == 0 || self.rcv_wnd == 0 {
             return Err(KcpError::config("Window sizes must be greater than 0"));
         }
+        // The wire `wnd` field is a u16; a larger window is silently truncated
+        // when advertised, so the peer would size its send window wrong.
+        if self.snd_wnd > u16::MAX as u32 || self.rcv_wnd > u16::MAX as u32 {
+            return Err(KcpError::config("Window sizes must not exceed 65535"));
+        }
         if self.nodelay.interval == 0 {
             return Err(KcpError::config("Update interval must be greater than 0"));
         }

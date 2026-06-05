@@ -248,6 +248,21 @@ impl<T: Transport> KcpListener<T> {
         if data.len() >= KcpHeader::SIZE {
             let mut data_clone = data.clone();
             if let Some(header) = KcpHeader::decode(&mut data_clone) {
+                // Cheap filter: only a valid KCP command byte may open a new
+                // connection. Rejects port scans / stray UDP from spawning
+                // phantom pending entries (and from reaching the engine's
+                // segment parser via accept()).
+                if !matches!(
+                    header.cmd,
+                    constants::IKCP_CMD_PUSH
+                        | constants::IKCP_CMD_ACK
+                        | constants::IKCP_CMD_WASK
+                        | constants::IKCP_CMD_WINS
+                ) {
+                    trace!(peer = %peer_addr, cmd = header.cmd, "Ignoring non-KCP datagram");
+                    return Ok(());
+                }
+
                 let state = conn_state.read().await;
 
                 if state.active.contains(peer_addr) {
