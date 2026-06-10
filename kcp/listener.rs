@@ -87,6 +87,7 @@ impl KcpListener<UdpTransport> {
 impl<T: Transport> KcpListener<T> {
     /// Create a listener using a custom [`Transport`].
     pub async fn with_transport(transport: Arc<T>, config: KcpConfig) -> Result<Self> {
+        config.validate()?;
         let local_addr = transport.local_addr().map_err(KcpError::Io)?;
 
         let (connection_sender, connection_queue) = mpsc::channel(config.max_pending_connections);

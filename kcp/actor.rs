@@ -73,6 +73,14 @@ impl EngineHandle {
     pub fn close(&self) {
         let _ = self.cmd_tx.try_send(EngineCmd::Close);
     }
+
+    /// Deliver `Close` reliably: unlike [`close`](Self::close), waits for
+    /// channel capacity instead of silently dropping the command when the
+    /// actor is busy. Used by graceful shutdown, where a lost Close would
+    /// leave the caller waiting on an actor that never starts draining.
+    pub async fn close_graceful(&self) {
+        let _ = self.cmd_tx.send(EngineCmd::Close).await;
+    }
 }
 
 /// Run the engine actor loop.
@@ -140,6 +148,21 @@ pub(crate) async fn run_engine_actor<T: Transport>(
 
                 // Keep-alive: probe at most once per keep-alive window.
                 if let Some(ka) = keep_alive_ms {
+                    // Dead-peer detection: `idle_ms` resets on any received
+                    // packet, and a live peer answers WASK probes with WINS,
+                    // so three silent keep-alive windows mean the peer is
+                    // gone. Without this, a silently-vanished peer leaves the
+                    // actor (and its server-side stream) alive forever —
+                    // probes aren't retransmitted and never count toward
+                    // `dead_link`.
+                    if engine.idle_ms() as u64 >= ka.saturating_mul(3) {
+                        warn!(
+                            idle_ms = engine.idle_ms(),
+                            keep_alive_ms = ka,
+                            "Peer silent for 3 keep-alive windows, closing connection"
+                        );
+                        break;
+                    }
                     if engine.idle_ms() as u64 >= ka
                         && last_probe.elapsed() >= std::time::Duration::from_millis(ka)
                     {
@@ -232,6 +255,28 @@ pub(crate) async fn run_engine_actor<T: Transport>(
                             // Should not happen: the stream chunks/validates writes
                             // below the engine's limit. Log rather than drop silently.
                             warn!(error = %e, "engine.send rejected outbound data");
+                        }
+                        // Absorb whatever else is already queued in the channel
+                        // before flushing once: engine.send() only queues (it no
+                        // longer flushes internally), so consecutive small
+                        // messages share MTU-packed datagrams instead of paying
+                        // one datagram + syscall each.
+                        while engine.send_queue_len() < send_high_water {
+                            match send_rx.try_recv() {
+                                Ok(more) => {
+                                    if let Err(e) = engine.send(more) {
+                                        warn!(error = %e, "engine.send rejected outbound data");
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                        if let Err(e) = engine.flush() {
+                            if e.is_fatal() {
+                                error!(error = %e, "Engine flush after send fatal, stopping actor");
+                                break;
+                            }
+                            warn!(error = %e, "Engine flush after send failed (recoverable)");
                         }
                         flush_output(&mut engine, &transport, &peer_addr, simulate_loss).await;
                     }

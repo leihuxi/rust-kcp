@@ -6,7 +6,7 @@
 //! - Concurrent connection testing
 //! - Real-time performance monitoring
 
-use kcp_tokio::{metrics, KcpConfig, KcpStream};
+use kcp_tokio::{KcpConfig, KcpStream};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 use tokio::{
@@ -473,13 +473,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     }
-
-    // Show global metrics
-    let global_metrics = metrics::global_metrics().snapshot();
-    info!(
-        "Global metrics: {}",
-        metrics::format_metrics(&global_metrics)
-    );
 
     info!("Test completed successfully!");
     Ok(())

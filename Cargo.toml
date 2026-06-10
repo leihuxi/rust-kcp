@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "kcp-tokio"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["Leihu.Xi leihuxi@gmail.com"]
 description = "A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Protocol"
@@ -21,20 +21,19 @@ tokio = ["dep:tokio"]
 
 [dependencies]
 # Core protocol engine
-kcp-core = { path = "kcp-core", version = "0.2.0" }
+kcp-core = { path = "kcp-core", version = "0.3.0" }
 
 # Core async runtime
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "sync", "time", "macros", "io-util", "signal"], optional = true }
 
 # Serialization and networking
-bytes = "1.0"
+bytes = "1.7"
 thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
 
 # Lock-free data structures
-crossbeam-queue = "0.3"
 dashmap = "6.1"
 
 [dev-dependencies]

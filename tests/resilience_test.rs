@@ -144,8 +144,15 @@ async fn test_packet_loss_recovery() {
     kcp1.start().unwrap();
     kcp2.start().unwrap();
 
+    // ~1 datagram per message: send() now queues and flush packs small
+    // messages into shared datagrams, so tiny messages could all fit in one
+    // datagram and (70% of the time) arrive without any loss/retransmission.
     let messages: Vec<Vec<u8>> = (0..10)
-        .map(|i| format!("loss-test-message-{:04}", i).into_bytes())
+        .map(|i| {
+            let mut m = format!("loss-test-message-{:04}", i).into_bytes();
+            m.resize(1000, b'x');
+            m
+        })
         .collect();
 
     // Send all messages

@@ -43,14 +43,18 @@ pub struct KcpStream<T: Transport = UdpTransport> {
     transport: Arc<T>,
     peer_addr: T::Addr,
     /// Max segment size (mtu − header). `poll_write` chunks the byte stream to
-    /// this so no single KCP message exceeds the engine's fragment limit; also
-    /// the size ceiling enforced by the message-oriented [`send`](Self::send).
+    /// this so no single KCP message exceeds the engine's fragment limit.
     mss: usize,
+    /// Largest single message [`send`](Self::send) accepts: `mss` × the
+    /// fragment count the engine can reassemble (bounded by `rcv_wnd`,
+    /// assuming symmetric peer configuration).
+    max_msg: usize,
 
     // Read/write state
     read_buf: BytesMut,
     pending_write: Option<Pin<Box<dyn Future<Output = io::Result<usize>> + Send>>>,
     pending_flush: Option<Pin<Box<dyn Future<Output = io::Result<()>> + Send>>>,
+    pending_shutdown: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 
     // Background tasks
     actor_task: Option<tokio::task::JoinHandle<()>>,
@@ -66,7 +70,11 @@ pub struct KcpStream<T: Transport = UdpTransport> {
 impl KcpStream<UdpTransport> {
     /// Connect to a remote KCP server
     pub async fn connect(addr: SocketAddr, config: KcpConfig) -> Result<Self> {
-        let transport = UdpTransport::bind("0.0.0.0:0")
+        // Bind in the target's address family — a v4 wildcard socket cannot
+        // send to a v6 peer (every send_to would fail, surfacing as a stream
+        // that connects but never receives).
+        let bind_addr = if addr.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+        let transport = UdpTransport::bind(bind_addr)
             .await
             .map_err(KcpError::Io)?;
         let transport = Arc::new(transport);
@@ -98,6 +106,7 @@ impl<T: Transport> KcpStream<T> {
         conv: ConvId,
         config: KcpConfig,
     ) -> Result<Self> {
+        config.validate()?;
         let mut engine = KcpEngine::new(conv, config.clone());
         engine.start()?;
 
@@ -112,6 +121,7 @@ impl<T: Transport> KcpStream<T> {
         let simulate_loss = config.simulate_packet_loss;
         let send_high_water = send_high_water(&config);
         let mss = config.mtu.saturating_sub(constants::IKCP_OVERHEAD).max(1) as usize;
+        let max_msg = mss * config.rcv_wnd.min(constants::IKCP_WND_RCV) as usize;
 
         let transport_actor = transport.clone();
         let actor_peer = peer_addr.clone();
@@ -140,9 +150,11 @@ impl<T: Transport> KcpStream<T> {
             transport,
             peer_addr,
             mss,
-            read_buf: crate::common::try_get_buffer(2048),
+            max_msg,
+            read_buf: BytesMut::with_capacity(2048),
             pending_write: None,
             pending_flush: None,
+            pending_shutdown: None,
             actor_task: Some(actor_task),
             recv_task: Some(recv_task),
             connected: true,
@@ -168,6 +180,7 @@ impl<T: Transport> KcpStream<T> {
         config: KcpConfig,
         initial_packet: Bytes,
     ) -> Result<Self> {
+        config.validate()?;
         let mut engine = KcpEngine::new(client_conv, config.clone());
         engine.start()?;
 
@@ -191,6 +204,7 @@ impl<T: Transport> KcpStream<T> {
         let simulate_loss = config.simulate_packet_loss;
         let send_high_water = send_high_water(&config);
         let mss = config.mtu.saturating_sub(constants::IKCP_OVERHEAD).max(1) as usize;
+        let max_msg = mss * config.rcv_wnd.min(constants::IKCP_WND_RCV) as usize;
 
         let transport_actor = transport.clone();
         let actor_peer = peer_addr.clone();
@@ -217,9 +231,11 @@ impl<T: Transport> KcpStream<T> {
             transport,
             peer_addr,
             mss,
-            read_buf: crate::common::try_get_buffer(2048),
+            max_msg,
+            read_buf: BytesMut::with_capacity(2048),
             pending_write: None,
             pending_flush: None,
+            pending_shutdown: None,
             actor_task: Some(actor_task),
             recv_task: None,
             connected: true,
@@ -263,15 +279,14 @@ impl<T: Transport> KcpStream<T> {
         if self.closed {
             return Err(KcpError::connection(ConnectionError::Closed));
         }
-        // The engine rejects a single message that needs IKCP_WND_RCV or more
-        // fragments; fail fast with a clear error rather than letting it be
-        // silently dropped in the actor.
-        let max_msg = self.mss * (constants::IKCP_WND_RCV as usize - 1);
-        if data.len() > max_msg {
+        // The engine rejects a single message with more fragments than the
+        // receive window can reassemble; fail fast with a clear error rather
+        // than letting it be silently dropped in the actor.
+        if data.len() > self.max_msg {
             return Err(KcpError::buffer(format!(
                 "message of {} bytes exceeds max {} for one send; use AsyncWrite for streaming",
                 data.len(),
-                max_msg
+                self.max_msg
             )));
         }
         self.send_tx
@@ -315,8 +330,9 @@ impl<T: Transport> KcpStream<T> {
         }
         self.closed = true;
 
-        // Signal actor to flush and stop
-        self.handle.close();
+        // Signal actor to flush and stop. Awaits channel capacity so the
+        // Close command can't be dropped when the actor is momentarily busy.
+        self.handle.close_graceful().await;
 
         // Wait for the actor to finish its graceful drain (it breaks as soon as
         // the peer has acknowledged everything; this is just an upper bound).
@@ -348,7 +364,17 @@ impl<T: Transport> KcpStream<T> {
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65536];
             loop {
-                match transport.recv_from(&mut buf).await {
+                let recv = tokio::select! {
+                    r = transport.recv_from(&mut buf) => r,
+                    // Actor exited (graceful close finished). Without this the
+                    // task — and the socket it holds — would park in recv_from
+                    // forever on a quiet link, since Drop no longer aborts it.
+                    _ = input_tx.closed() => {
+                        trace!("Input channel closed, stopping recv task");
+                        return;
+                    }
+                };
+                match recv {
                     Ok((size, src_addr)) => {
                         if src_addr != peer_addr {
                             trace!(
@@ -379,16 +405,14 @@ impl<T: Transport> Unpin for KcpStream<T> {}
 
 impl<T: Transport> Drop for KcpStream<T> {
     fn drop(&mut self) {
-        // Signal actor to shut down
+        // Best-effort Close signal; even if the cmd channel is full, dropping
+        // our cmd_tx below closes the channel, which the actor also treats as
+        // Close. The actor is deliberately NOT aborted: it keeps
+        // retransmitting until the peer has acknowledged all in-flight data
+        // (or its linger deadline passes), so dropping a stream right after
+        // writing doesn't lose the tail. The recv_task exits on its own once
+        // the actor is gone (see `input_tx.closed()` in spawn_recv_task).
         self.handle.close();
-        self.abort_tasks();
-
-        // Return read buffer to pool for memory efficiency
-        if !self.read_buf.is_empty() {
-            let mut buf = std::mem::take(&mut self.read_buf);
-            buf.clear();
-            crate::common::try_put_buffer(buf);
-        }
     }
 }
 
@@ -401,16 +425,17 @@ impl<T: Transport> AsyncRead for KcpStream<T> {
     ) -> Poll<io::Result<()>> {
         trace!("poll_read called");
 
-        if self.closed {
-            return Poll::Ready(Ok(()));
-        }
-
-        // Check if we have data in our buffer first
+        // Drain locally buffered data even when closed — `closed` only means
+        // no more data will arrive, not that already-received bytes vanish.
         if !self.read_buf.is_empty() {
             let to_copy = std::cmp::min(buf.remaining(), self.read_buf.len());
             buf.put_slice(&self.read_buf[..to_copy]);
             self.read_buf.advance(to_copy);
             trace!("Returning {} bytes from buffer", to_copy);
+            return Poll::Ready(Ok(()));
+        }
+
+        if self.closed {
             return Poll::Ready(Ok(()));
         }
 
@@ -450,20 +475,32 @@ impl<T: Transport> AsyncWrite for KcpStream<T> {
             )));
         }
 
-        // Reuse pending future if it exists (don't recreate on every poll).
-        // The future awaits the bounded send channel, so a full channel parks
-        // the writer (backpressure) instead of overflowing the engine. The write
-        // is chunked to one MSS so each KCP message is a single segment — the
-        // byte-stream has no message boundaries to preserve, and this keeps any
-        // one message well under the engine's fragment limit.
+        // The write is chunked to one MSS so each KCP message is a single
+        // segment — the byte-stream has no message boundaries to preserve, and
+        // this keeps any one message well under the engine's fragment limit.
         if self.pending_write.is_none() {
-            let send_tx = self.send_tx.clone();
             let len = buf.len().min(self.mss);
             let data = Bytes::copy_from_slice(&buf[..len]);
-            self.pending_write = Some(Box::pin(async move {
-                send_tx.send(data).await.map_err(io::Error::other)?;
-                Ok(len)
-            }));
+            // Fast path: hand the chunk off without allocating a future (this
+            // boxed future per MSS chunk was the hot-path allocation in
+            // poll_write). Only a full channel — real backpressure — pays for
+            // the future that parks the writer on channel capacity.
+            match self.send_tx.try_send(data) {
+                Ok(()) => return Poll::Ready(Ok(len)),
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "connection closed",
+                    )));
+                }
+                Err(mpsc::error::TrySendError::Full(data)) => {
+                    let send_tx = self.send_tx.clone();
+                    self.pending_write = Some(Box::pin(async move {
+                        send_tx.send(data).await.map_err(io::Error::other)?;
+                        Ok(len)
+                    }));
+                }
+            }
         }
 
         match self.pending_write.as_mut().unwrap().as_mut().poll(cx) {
@@ -497,9 +534,33 @@ impl<T: Transport> AsyncWrite for KcpStream<T> {
         }
     }
 
-    fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.closed = true;
-        self.handle.close();
-        Poll::Ready(Ok(()))
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.closed {
+            return Poll::Ready(Ok(()));
+        }
+
+        // Graceful shutdown: deliver Close to the actor, then wait for it to
+        // finish draining (peer ACKs all in-flight data, or the actor's linger
+        // deadline passes). Returning Ready before the drain completes would
+        // let callers drop the stream and lose the unacknowledged tail.
+        if self.pending_shutdown.is_none() {
+            let handle = self.handle.clone();
+            let actor = self.actor_task.take();
+            self.pending_shutdown = Some(Box::pin(async move {
+                handle.close_graceful().await;
+                if let Some(actor) = actor {
+                    let _ = actor.await;
+                }
+            }));
+        }
+
+        match self.pending_shutdown.as_mut().unwrap().as_mut().poll(cx) {
+            Poll::Ready(()) => {
+                self.pending_shutdown = None;
+                self.closed = true;
+                Poll::Ready(Ok(()))
+            }
+            Poll::Pending => Poll::Pending,
+        }
     }
 }

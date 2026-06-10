@@ -6,7 +6,7 @@
 //! - Concurrent connection handling
 //! - Comprehensive metrics reporting
 
-use kcp_tokio::{metrics, KcpConfig, KcpListener};
+use kcp_tokio::{KcpConfig, KcpListener};
 use std::time::{Duration, Instant};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
@@ -141,28 +141,12 @@ async fn stats_monitor(mut stats_rx: mpsc::UnboundedReceiver<(u64, u64)>) {
         select! {
             _ = interval.tick() => {
                 // Print periodic stats
-                let global_metrics = metrics::global_metrics().snapshot();
-                let buffer_stats = kcp_tokio::buffer_pool::buffer_pool_stats();
-
                 info!("=== Server Performance Stats ===");
-                info!("Active connections: {}", global_metrics.active_connections);
                 info!("Messages processed: {} ({:.0}/s)",
                       total_stats.total_messages, total_stats.message_rate());
                 info!("Data processed: {:.2} MB ({:.2} Mbps)",
                       total_stats.total_bytes as f64 / 1_000_000.0, total_stats.throughput_mbps());
                 info!("Uptime: {:.1}s", total_stats.uptime().as_secs_f64());
-
-                info!("Buffer pool stats:");
-                for (name, hits, size) in buffer_stats {
-                    info!("  {}: {} buffers cached, {} hits", name, size, hits);
-                }
-
-                if global_metrics.total_packets_sent > 0 {
-                    let loss_rate = (global_metrics.total_retransmissions as f64 /
-                                   global_metrics.total_packets_sent as f64) * 100.0;
-                    info!("Packet loss rate: {:.3}%", loss_rate);
-                }
-
                 info!("====================================");
             }
 
@@ -202,9 +186,6 @@ async fn run_server(addr: &str, config: KcpConfig) -> Result<(), Box<dyn std::er
 
                         let stats_tx_clone = stats_tx.clone();
                         tokio::spawn(handle_client(stream, client_id, stats_tx_clone));
-
-                        // Update global metrics
-                        metrics::global_metrics().connection_created();
                     }
                     Err(e) => {
                         error!("Failed to accept connection: {}", e);

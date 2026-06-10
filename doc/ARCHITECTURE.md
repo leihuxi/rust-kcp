@@ -69,7 +69,7 @@ pub struct KcpEngine {
 - `BTreeMap` receive buffer for O(log n) insertion of out-of-order packets
 - Zero-copy segment encoding in flush (encodes by reference, no clone)
 - Cached timestamps to minimize syscalls per `input()` call
-- Lock-free buffer pool integration
+- Datagram batching: small messages share MTU-packed datagrams
 - Configurable congestion control
 - Fast retransmission support
 
@@ -173,24 +173,11 @@ Network ──────► UDP Socket
 
 ## Memory Management
 
-### Buffer Pool Architecture
-
-Lock-free buffer pools using `crossbeam::queue::ArrayQueue`:
-
-```
-┌────────────────────────────────────────────────┐
-│              Global Buffer Pools               │
-├────────────┬────────────┬──────────┬──────────┤
-│   SMALL    │   MEDIUM   │   LARGE  │  JUMBO   │
-│  ≤1024B    │  ≤1400B    │  ≤8192B  │ ≤65536B  │
-│  4000 buf  │  2000 buf  │ 1000 buf │  200 buf │
-└────────────┴────────────┴──────────┴──────────┘
-```
-
-**Benefits:**
-- Zero-allocation fast path for hot code
-- Lock-free access via atomic operations
-- Automatic size-based pool selection
+Outbound datagrams are carved off a single reusable `BytesMut` (`out_buf`)
+via `split()`; `reserve()` reclaims the allocation once the sent `Bytes`
+handles drop, so steady-state flushing does not allocate per datagram.
+Inbound packets and read buffers use plain `BytesMut`/`Bytes` — refcounted,
+zero-copy slicing via the `bytes` crate.
 
 ## Concurrency Model
 
@@ -287,7 +274,7 @@ The built-in `UdpTransport` uses `tokio::net::UdpSocket` with `Addr = SocketAddr
 5. **Zero-copy segment flush** - `flush_data_segments()` encodes by reference, no `segment.clone()`
 6. **Cached timestamps** - Single `current_timestamp()` syscall per `input()` (was 3+)
 7. **Pre-allocated buffers** - `VecDeque::with_capacity` based on window sizes, avoiding grow on send burst
-8. **Lock-free Buffer Pool** - Crossbeam ArrayQueue for zero-allocation fast path
+8. **Datagram batching** - send() queues; flush() packs small messages into shared MTU-sized datagrams; out_buf recycled via split()/reserve()
 9. **Batch ACK Processing** - Pre-allocated vectors
 10. **Inline Helper Methods** - `mss()`, `reset_cwnd()`
 11. **Grouped State Structs** - Better cache locality

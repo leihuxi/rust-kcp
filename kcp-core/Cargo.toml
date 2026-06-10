@@ -1,6 +1,6 @@
 [package]
 name = "kcp-core"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Pure synchronous KCP protocol engine"
 license = "MIT"
@@ -11,5 +11,5 @@ default = ["tracing"]
 tracing = ["dep:tracing"]
 
 [dependencies]
-bytes = "1.0"
+bytes = "1.7"
 tracing = { version = "0.1", optional = true }

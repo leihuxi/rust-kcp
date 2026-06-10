@@ -10,7 +10,6 @@ A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Pr
 
 - **Async-First Design**: Built from ground up for async/await with Tokio integration
 - **Zero-Copy**: Efficient buffer management using the `bytes` crate
-- **Lock-Free Buffer Pool**: High-performance memory management with `crossbeam`
 - **Connection-Oriented**: High-level connection abstractions (`KcpStream`, `KcpListener`)
 - **Backpressure Both Ways**: Bounded send/receive paths — a fast writer over a
   slow link blocks instead of growing memory without bound; received data is
@@ -21,7 +20,7 @@ A high-performance async Rust implementation of KCP - A Fast and Reliable ARQ Pr
   instead of polling every interval — idle connections cost almost nothing
 - **Monotonic Clock**: RTT/RTO immune to wall-clock (NTP) jumps
 - **Protocol Compatible**: Interoperable with the original C KCP and `tokio_kcp`
-- **Observability**: Integrated tracing and metrics support
+- **Observability**: Integrated tracing support and per-stream `stats()`
 - **Multiple Performance Modes**: Normal, Fast, Turbo, Gaming presets
 
 ## Installation
@@ -30,7 +29,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-kcp-tokio = "0.4"
+kcp-tokio = "0.7"
 tokio = { version = "1.0", features = ["full"] }
 ```
 
@@ -207,7 +206,7 @@ KCP provides significant latency improvements over TCP:
 - **Actor-based lock-free architecture**: KcpEngine runs in a single dedicated tokio task, eliminating `Arc<Mutex<>>` contention
 - **Generic Transport trait**: Associated `Addr` type with RPITIT — zero heap allocation on hot path (no `Pin<Box<dyn Future>>`)
 - **DashMap for packet routing**: Listener uses lock-free concurrent hashmap on the hot path
-- **Lock-free buffer pools**: `crossbeam::queue::ArrayQueue` for zero-allocation fast path
+- **Datagram batching**: `send()` queues and `flush()` packs small messages into shared MTU-sized datagrams; the outbound buffer is recycled via `BytesMut::split`, not reallocated per datagram
 - **BTreeMap receive buffer**: O(log n) insertion for out-of-order packets (vs O(n) linear scan)
 - **Zero-copy segment encoding**: Flush avoids cloning segments, encodes by reference
 - **Cached timestamps**: Single syscall per `input()` call instead of 3+
@@ -261,6 +260,7 @@ cargo bench
 
 ## Version History
 
+- **v0.7.0**: Close-semantics and liveness fixes (graceful shutdown drain, dead-peer detection, fragment-deadlock fail-fast, IPv6 clients, config validation on main APIs); send-path performance (datagram batching, poll_write fast path, O(n) stream-mode merge); removed decorative buffer_pool/metrics modules
 - **v0.4.0**: Extract kcp-core as standalone protocol crate, restructure source layout (src/ → kcp/, flatten async_kcp/)
 - **v0.3.7**: Fix ACK window/UNA fields, generic Transport trait with RPITIT, resilience tests, criterion benchmarks
 - **v0.3.4**: Engine refactoring, lock-free buffer pools, documentation

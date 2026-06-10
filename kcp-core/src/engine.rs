@@ -91,7 +91,11 @@ pub struct KcpEngine {
 impl KcpEngine {
     /// Create a new KCP engine
     pub fn new(conv: ConvId, config: impl Into<KcpCoreConfig>) -> Self {
-        let config = config.into();
+        let mut config = config.into();
+        // mss() computes `mtu - IKCP_OVERHEAD`; an mtu at or below the header
+        // size would underflow (panic in debug, wrap to a ~4G mss in release).
+        // Clamp here so every later use of mtu/mss is safe.
+        config.mtu = config.mtu.max(constants::IKCP_OVERHEAD + 1);
         let min_rto = if config.nodelay.nodelay {
             constants::IKCP_RTO_NDL
         } else {
@@ -171,7 +175,12 @@ impl KcpEngine {
         std::mem::take(&mut self.output_queue)
     }
 
-    /// Send data through KCP
+    /// Queue data for sending through KCP.
+    ///
+    /// Like canonical KCP's `ikcp_send`, this only queues — the caller drives
+    /// emission via [`flush`](Self::flush) (or [`update`](Self::update)).
+    /// Queuing several messages before one flush lets them share MTU-packed
+    /// datagrams instead of paying one datagram per message.
     pub fn send(&mut self, data: Bytes) -> KcpCoreResult<()> {
         self.last_activity = current_timestamp();
         if data.is_empty() {
@@ -188,15 +197,24 @@ impl KcpEngine {
                 if old_len < mss {
                     let capacity = mss - old_len;
                     let extend = std::cmp::min(data.len(), capacity);
-                    let mut buf = BytesMut::with_capacity(old_len + extend);
-                    buf.extend_from_slice(&last.data);
+                    // Append in place when we hold the only reference; the
+                    // first append migrates the data once into an mss-capacity
+                    // buffer, so N small appends cost O(n) total instead of
+                    // re-copying the accumulated segment every time (O(n²)).
+                    let mut buf = match std::mem::take(&mut last.data).try_into_mut() {
+                        Ok(buf) => buf,
+                        Err(shared) => {
+                            let mut buf = BytesMut::with_capacity(mss);
+                            buf.extend_from_slice(&shared);
+                            buf
+                        }
+                    };
                     buf.extend_from_slice(&data[..extend]);
                     last.data = buf.freeze();
                     last.header.len = last.data.len() as u32;
                     data = data.slice(extend..);
                     if data.is_empty() {
                         self.stats.bytes_sent += extend as u64;
-                        self.flush()?;
                         return Ok(());
                     }
                 }
@@ -209,9 +227,16 @@ impl KcpEngine {
             data.len().div_ceil(mss)
         };
 
-        // Check if we can send all fragments
-        if count >= constants::IKCP_WND_RCV as usize {
-            return Err(KcpCoreError::buffer("Message too large for window"));
+        // A message whose fragment count exceeds the receiver's window can
+        // never be reassembled (the receive queue fills before the fragment
+        // chain completes) and deadlocks the connection. The peer's window is
+        // not knowable here, so assume symmetric configuration and bound by
+        // our own `rcv_wnd` — failing fast beats a silent protocol deadlock.
+        let max_frags = self.config.rcv_wnd.min(constants::IKCP_WND_RCV) as usize;
+        if count > max_frags {
+            return Err(KcpCoreError::buffer(format!(
+                "Message needs {count} fragments, exceeding the {max_frags} the receive window can reassemble"
+            )));
         }
 
         // Fragment the data
@@ -232,9 +257,6 @@ impl KcpEngine {
         }
 
         self.stats.bytes_sent += data.len() as u64;
-
-        // Trigger immediate flush if possible
-        self.flush()?;
 
         trace!(
             conv = %self.conv,
@@ -600,7 +622,13 @@ impl KcpEngine {
             return;
         }
 
-        if let Some(pos) = self.snd_buf.iter().position(|s| s.header.sn == sn) {
+        // snd_buf is ordered by sn, so binary search replaces the linear scan
+        // (noticeable under large windows). time_diff is a wrapping-safe
+        // ordering within one window's span.
+        if let Ok(pos) = self
+            .snd_buf
+            .binary_search_by(|s| time_diff(s.header.sn, sn).cmp(&0))
+        {
             self.snd_buf.remove(pos);
         }
     }
@@ -936,8 +964,10 @@ impl KcpEngine {
     fn output_segment(&mut self, segment: KcpSegment) -> KcpCoreResult<()> {
         let need = segment.size();
         if self.out_buf.len() + need > self.config.mtu as usize && !self.out_buf.is_empty() {
-            self.output_queue.push(std::mem::take(&mut self.out_buf).freeze());
-            self.out_buf = BytesMut::with_capacity(self.config.mtu as usize);
+            self.output_queue.push(self.out_buf.split().freeze());
+            // reserve() reclaims the previous allocation once the sent Bytes
+            // are dropped, instead of allocating a fresh buffer per datagram.
+            self.out_buf.reserve(self.config.mtu as usize);
         }
         segment.encode(&mut self.out_buf);
         self.stats.packets_sent += 1;
@@ -949,8 +979,8 @@ impl KcpEngine {
     /// leave the engine.
     fn flush_out_buf(&mut self) {
         if !self.out_buf.is_empty() {
-            self.output_queue.push(std::mem::take(&mut self.out_buf).freeze());
-            self.out_buf = BytesMut::with_capacity(self.config.mtu as usize);
+            self.output_queue.push(self.out_buf.split().freeze());
+            self.out_buf.reserve(self.config.mtu as usize);
         }
     }
 

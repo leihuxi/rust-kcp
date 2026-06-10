@@ -54,7 +54,6 @@ pub use kcp_core;
 
 // ── Layer 2: Transport & runtime infrastructure ─────────────────────────
 
-pub mod buffer_pool;
 pub mod transport;
 pub use transport::{Addr, Transport};
 #[cfg(feature = "tokio")]
@@ -82,9 +81,6 @@ pub mod listener;
 pub use stream::KcpStream;
 #[cfg(feature = "tokio")]
 pub use listener::KcpListener;
-
-#[cfg(feature = "tokio")]
-pub mod metrics;
 
 // ── Internal convenience re-exports ─────────────────────────────────────
 
