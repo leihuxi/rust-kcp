@@ -8,16 +8,36 @@ use crate::transport::{Addr, Transport, UdpTransport};
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Duration, Instant};
 use tracing::{debug, error, info, trace, warn};
 
+/// Routing key: a session is identified by peer address *and* conversation
+/// id, so a new session from the same source port (different conv) is never
+/// mistaken for — or blocked by — a stale one (issue #7).
+type SessionKey<A> = (A, ConvId);
+
 /// Lock-free stream handle for packet routing — just a channel sender.
 struct StreamHandle {
     input_tx: mpsc::Sender<Bytes>,
+    /// For a primary entry `(addr, server_conv)` whose handshake arrived with
+    /// `conv == 0`: true while the `(addr, 0)` alias still exists. Cleared
+    /// (and the alias removed) once the peer sends its first packet under
+    /// `server_conv`, so a later `conv == 0` handshake from the same address
+    /// opens a fresh session instead of being absorbed by this one.
+    has_zero_alias: AtomicBool,
+    /// Set on the `(addr, 0)` alias entry: the server conv it stands in for.
+    alias_of: Option<ConvId>,
+}
+
+/// Read the conv field (first 4 bytes, little-endian) of a KCP datagram.
+fn wire_conv(data: &[u8]) -> Option<ConvId> {
+    data.get(..4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
 /// Incoming connection information
@@ -36,18 +56,23 @@ pub struct IncomingConnection<A: Addr> {
 }
 
 /// Connection management state (consolidated into one struct behind a single lock)
+///
+/// `pending` / `accepting` are keyed by the conv seen on the wire in the
+/// first packet; `active` holds every routing key registered in
+/// `active_streams` (the primary `(addr, server_conv)` plus any `(addr, 0)`
+/// alias).
 struct ConnectionState<A: Addr> {
-    pending: HashMap<A, IncomingConnection<A>>,
-    accepting: std::collections::HashSet<A>,
-    active: std::collections::HashSet<A>,
+    pending: HashMap<SessionKey<A>, IncomingConnection<A>>,
+    accepting: HashSet<SessionKey<A>>,
+    active: HashSet<SessionKey<A>>,
 }
 
 impl<A: Addr> ConnectionState<A> {
     fn new() -> Self {
         Self {
             pending: HashMap::new(),
-            accepting: std::collections::HashSet::new(),
-            active: std::collections::HashSet::new(),
+            accepting: HashSet::new(),
+            active: HashSet::new(),
         }
     }
 }
@@ -61,7 +86,7 @@ pub struct KcpListener<T: Transport = UdpTransport> {
     // Connection management (single lock for pending/accepting/active)
     conn_state: Arc<RwLock<ConnectionState<T::Addr>>>,
     // Active streams for packet routing (lock-free concurrent map, accessed on every packet)
-    active_streams: Arc<DashMap<T::Addr, StreamHandle>>,
+    active_streams: Arc<DashMap<SessionKey<T::Addr>, StreamHandle>>,
 
     connection_queue: mpsc::Receiver<IncomingConnection<T::Addr>>,
     connection_sender: mpsc::Sender<IncomingConnection<T::Addr>>,
@@ -113,26 +138,33 @@ impl<T: Transport> KcpListener<T> {
     pub async fn accept(&mut self) -> Result<(KcpStream<T>, T::Addr)> {
         loop {
             if let Some(incoming) = self.connection_queue.recv().await {
-                // Save peer_addr for cleanup; move incoming by value below
-                let peer_addr = incoming.peer_addr.clone();
+                // Save the key for cleanup; move incoming by value below
+                let key = (incoming.peer_addr.clone(), incoming.client_conv);
 
                 // Mark as accepting to prevent duplicate processing
                 {
                     let mut state = self.conn_state.write().await;
 
-                    if state.active.contains(&peer_addr) {
-                        info!(peer = %peer_addr, "Ignoring connection attempt from active peer");
+                    if state.active.contains(&key) {
+                        info!(
+                            peer = %key.0,
+                            conv = key.1,
+                            "Ignoring connection attempt for an active session"
+                        );
+                        state.pending.remove(&key);
                         continue;
                     }
 
-                    state.accepting.insert(peer_addr.clone());
+                    state.accepting.insert(key.clone());
                 }
 
                 // Move incoming (avoids cloning Bytes + entire IncomingConnection)
                 let result = self.create_stream_for_connection(incoming).await;
                 {
                     let mut state = self.conn_state.write().await;
-                    state.accepting.remove(&peer_addr);
+                    state.accepting.remove(&key);
+                    // On failure, drop the pending entry too so the peer can retry.
+                    state.pending.remove(&key);
                 }
                 match result {
                     Ok(stream) => return Ok(stream),
@@ -157,10 +189,13 @@ impl<T: Transport> KcpListener<T> {
         self.conn_state.read().await.pending.len()
     }
 
-    /// Remove a connection from active tracking (called when stream is dropped)
+    /// Remove every session from `peer_addr` from active tracking and packet
+    /// routing. Dead sessions are also removed automatically, so calling this
+    /// is optional.
     pub async fn remove_active_connection(&self, peer_addr: &T::Addr) {
         let mut state = self.conn_state.write().await;
-        state.active.remove(peer_addr);
+        state.active.retain(|(addr, _)| addr != peer_addr);
+        self.active_streams.retain(|(addr, _), _| addr != peer_addr);
         debug!(peer = %peer_addr, "Removed active connection");
     }
 
@@ -198,10 +233,17 @@ impl<T: Transport> KcpListener<T> {
                                 let data = Bytes::copy_from_slice(&buf[..size]);
                                 trace!("Received {} bytes from {}", size, peer_addr);
 
-                                // First check if this is from an active stream (lock-free lookup)
-                                if let Some(handle) = active_streams.get(&peer_addr) {
-                                    let _ = handle.input_tx.try_send(data);
-                                    continue;
+                                // Route to an active session (lock-free lookup)
+                                if let Some(conv) = wire_conv(&data) {
+                                    if Self::route_to_active(
+                                        &active_streams,
+                                        &conn_state,
+                                        &peer_addr,
+                                        conv,
+                                        &data,
+                                    ).await {
+                                        continue;
+                                    }
                                 }
 
                                 // Not an active stream, handle as potential new connection
@@ -264,19 +306,20 @@ impl<T: Transport> KcpListener<T> {
                     return Ok(());
                 }
 
+                let key = (peer_addr.clone(), header.conv);
                 let state = conn_state.read().await;
 
-                if state.active.contains(peer_addr) {
-                    trace!(peer = %peer_addr, "Packet from active connection, ignoring");
+                if state.active.contains(&key) {
+                    trace!(peer = %peer_addr, conv = header.conv, "Packet from active session, ignoring");
                     return Ok(());
                 }
 
-                if state.accepting.contains(peer_addr) {
+                if state.accepting.contains(&key) {
                     trace!(peer = %peer_addr, "Connection is being accepted");
                     return Ok(());
                 }
 
-                if state.pending.contains_key(peer_addr) {
+                if state.pending.contains_key(&key) {
                     trace!(peer = %peer_addr, "Connection already pending");
                     return Ok(());
                 }
@@ -320,13 +363,13 @@ impl<T: Transport> KcpListener<T> {
                 };
 
                 let mut state = conn_state.write().await;
-                state.pending.insert(peer_addr.clone(), incoming.clone());
+                state.pending.insert(key.clone(), incoming.clone());
                 drop(state);
 
                 if connection_sender.try_send(incoming).is_err() {
                     warn!("Connection queue is full or closed");
                     let mut state = conn_state.write().await;
-                    state.pending.remove(peer_addr);
+                    state.pending.remove(&key);
                 } else {
                     debug!(
                         peer = %peer_addr,
@@ -357,35 +400,120 @@ impl<T: Transport> KcpListener<T> {
         )
         .await?;
 
-        // Create a lightweight handle for packet routing
-        let handle = StreamHandle {
-            input_tx: stream.input_sender(),
-        };
+        let client_conv = incoming.client_conv;
+        let server_conv = incoming.conv;
+        let primary = (peer_addr.clone(), server_conv);
+        // A conv=0 handshake keeps an `(addr, 0)` alias until the peer switches
+        // to `server_conv`, so its handshake retransmits are absorbed by this
+        // session instead of opening duplicate sessions.
+        let alias = (client_conv != server_conv).then(|| (peer_addr.clone(), client_conv));
 
-        // Mark connection as active and save the handle
+        // Register routing before marking active, so a packet that sees the key
+        // in `active` always finds the handle too.
+        self.active_streams.insert(
+            primary.clone(),
+            StreamHandle {
+                input_tx: stream.input_sender(),
+                has_zero_alias: AtomicBool::new(alias.is_some()),
+                alias_of: None,
+            },
+        );
+        if let Some(alias) = &alias {
+            self.active_streams.insert(
+                alias.clone(),
+                StreamHandle {
+                    input_tx: stream.input_sender(),
+                    has_zero_alias: AtomicBool::new(false),
+                    alias_of: Some(server_conv),
+                },
+            );
+        }
         {
             let mut state = self.conn_state.write().await;
-            state.pending.remove(&peer_addr);
-            state.active.insert(peer_addr.clone());
+            state.pending.remove(&(peer_addr.clone(), client_conv));
+            state.active.insert(primary);
+            if let Some(alias) = alias {
+                state.active.insert(alias);
+            }
         }
 
         info!(
             peer = %peer_addr,
-            conv = incoming.conv,
+            conv = server_conv,
             "Connection accepted and registered for packet routing"
         );
 
-        // Use final move for DashMap insert + return (avoids one clone)
-        self.active_streams.insert(peer_addr.clone(), handle);
         Ok((stream, peer_addr))
+    }
+
+    /// Route a datagram to the active session `(peer_addr, conv)`.
+    ///
+    /// Returns `false` when there is no live session for that key — including
+    /// when the entry belongs to a stream whose actor has exited, which is
+    /// removed on the spot rather than waiting for `cleanup_interval`, so the
+    /// caller can treat the packet as a new connection.
+    async fn route_to_active(
+        active_streams: &Arc<DashMap<SessionKey<T::Addr>, StreamHandle>>,
+        conn_state: &Arc<RwLock<ConnectionState<T::Addr>>>,
+        peer_addr: &T::Addr,
+        conv: ConvId,
+        data: &Bytes,
+    ) -> bool {
+        let key = (peer_addr.clone(), conv);
+        // Never hold a DashMap guard across another map operation (same-shard
+        // deadlock) or an await.
+        let (alive, drop_alias) = match active_streams.get(&key) {
+            None => return false,
+            Some(handle) => {
+                if handle.input_tx.is_closed() {
+                    (false, false)
+                } else {
+                    let _ = handle.input_tx.try_send(data.clone());
+                    (true, handle.has_zero_alias.swap(false, Ordering::Relaxed))
+                }
+            }
+        };
+
+        if alive {
+            if drop_alias {
+                // Peer has switched to the server conv: retire the conv=0 alias.
+                let alias = (peer_addr.clone(), 0);
+                if active_streams
+                    .remove_if(&alias, |_, h| h.alias_of == Some(conv))
+                    .is_some()
+                {
+                    conn_state.write().await.active.remove(&alias);
+                    trace!(peer = %peer_addr, conv, "Retired conv=0 handshake alias");
+                }
+            }
+            return true;
+        }
+
+        // Dead session: unregister it (and its alias) now.
+        let removed = active_streams.remove_if(&key, |_, h| h.input_tx.is_closed());
+        let mut state = conn_state.write().await;
+        state.active.remove(&key);
+        if let Some((_, h)) = removed {
+            if h.has_zero_alias.load(Ordering::Relaxed) {
+                let alias = (peer_addr.clone(), 0);
+                if active_streams
+                    .remove_if(&alias, |_, a| a.alias_of == Some(conv))
+                    .is_some()
+                {
+                    state.active.remove(&alias);
+                }
+            }
+        }
+        debug!(peer = %peer_addr, conv, "Removed dead session on new packet");
+        false
     }
 
     /// Remove streams whose input channel has closed (actor exited -> receiver dropped).
     async fn cleanup_dead_streams(
-        active_streams: &Arc<DashMap<T::Addr, StreamHandle>>,
+        active_streams: &Arc<DashMap<SessionKey<T::Addr>, StreamHandle>>,
         conn_state: &Arc<RwLock<ConnectionState<T::Addr>>>,
     ) {
-        let dead_addrs: Vec<T::Addr> = active_streams
+        let dead_addrs: Vec<SessionKey<T::Addr>> = active_streams
             .iter()
             .filter(|entry| entry.value().input_tx.is_closed())
             .map(|entry| entry.key().clone())

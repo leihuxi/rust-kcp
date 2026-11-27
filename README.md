@@ -260,6 +260,7 @@ cargo bench
 
 ## Version History
 
+- **v0.7.1**: `KcpListener` routes sessions by `(addr, conv)`, so reconnecting from the same source port works immediately (#7)
 - **v0.7.0**: Close-semantics and liveness fixes (graceful shutdown drain, dead-peer detection, fragment-deadlock fail-fast, IPv6 clients, config validation on main APIs); send-path performance (datagram batching, poll_write fast path, O(n) stream-mode merge); removed decorative buffer_pool/metrics modules
 - **v0.4.0**: Extract kcp-core as standalone protocol crate, restructure source layout (src/ → kcp/, flatten async_kcp/)
 - **v0.3.7**: Fix ACK window/UNA fields, generic Transport trait with RPITIT, resilience tests, criterion benchmarks

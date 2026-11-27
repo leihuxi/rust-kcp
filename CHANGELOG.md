@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here.
 
+## [kcp-tokio 0.7.1] — 2026-11-27
+
+### Fixed
+
+- **Reconnecting from the same source port** (#7): `KcpListener` now routes
+  sessions by `(peer_addr, conv)` instead of peer address alone. A new session
+  from an address that already has a (possibly stale) session is accepted
+  immediately instead of being dropped until the old server actor timed out
+  (3× `keep_alive`) and `cleanup_interval` elapsed. A packet that hits a dead
+  session unregisters it on the spot. conv=0 (tokio_kcp) handshakes keep an
+  `(addr, 0)` alias until the peer switches to the server-assigned conv.
+- `KcpListener::remove_active_connection` now removes every session of the
+  address from the routing map as well as the connection state.
+- A failed `accept()` clears its pending entry so the peer can retry.
+
 ## [kcp-tokio 0.7.0] / [kcp-core 0.3.0] — 2026-06-10
 
 A correctness pass over close semantics, liveness, and configuration safety,
